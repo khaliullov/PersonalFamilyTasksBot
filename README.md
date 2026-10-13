@@ -125,7 +125,7 @@ WIFE_ID=111111111
 MY_ID=222222222
 
 # Адрес локального Ollama
-OLLAMA_URL=http://localhost:11434/api/generate
+OLLAMA_URL=http://127.0.0.1:11434/api/generate
 OLLAMA_MODEL=qwen3.8:27b-mlx
 OLLAMA_TIMEOUT_SECONDS=120
 

@@ -36,7 +36,12 @@ WIFE_ID: int = int(os.getenv("WIFE_ID", "123456789"))
 MY_ID: int = int(os.getenv("MY_ID", "987654321"))
 
 # Параметры локального Ollama API
-OLLAMA_URL: str = os.getenv("OLLAMA_URL", "http://localhost:11434/api/generate")
+_raw_ollama_url: str = os.getenv("OLLAMA_URL", "http://127.0.0.1:11434")
+if not _raw_ollama_url.rstrip("/").endswith("/api/generate"):
+    OLLAMA_URL: str = f"{_raw_ollama_url.rstrip('/')}/api/generate"
+else:
+    OLLAMA_URL: str = _raw_ollama_url.rstrip("/")
+
 OLLAMA_MODEL: str = os.getenv("OLLAMA_MODEL", "qwen3.8:27b-mlx")
 
 # Путь к локальной базе данных SQLite
@@ -428,14 +433,22 @@ async def analyze_context_with_ollama(
         current_dt=current_dt,
     )
 
+    # ВАЖНО: Не передаем "format": "json", так как MLX-раннеры в Ollama не поддерживают
+    # constrained decoding / structured output и возвращают ошибку HTTP 501:
+    # {"error":"structured output is unavailable"}.
+    # Модель строго инструктирована системным промптом, а extract_and_parse_json парсит JSON.
     payload = {
         "model": model,
         "prompt": prompt,
         "stream": False,
-        "format": "json",
     }
 
-    logger.info("Отправка контекста (%d сообщений) в Ollama (%s)...", len(recent_messages), model)
+    logger.info(
+        "Отправка контекста (%d сообщений) в Ollama (%s) [%s]...",
+        len(recent_messages),
+        model,
+        ollama_url,
+    )
 
     timeout = aiohttp.ClientTimeout(total=OLLAMA_TIMEOUT_SECONDS)
     try:
@@ -837,6 +850,65 @@ async def handle_wife_business_message(message: types.Message, bot: Bot) -> None
     # 3. Регистрируем новую отложенную задачу обработки
     _debounce_tasks[WIFE_ID] = asyncio.create_task(
         _debounced_process_messages(bot=bot, user_id=WIFE_ID)
+    )
+
+
+@router.edited_business_message(F.from_user.id == WIFE_ID)
+async def handle_wife_edited_business_message(message: types.Message, bot: Bot) -> None:
+    """
+    Перехватывает отредактированные сообщения от жены в Telegram Business.
+    Обновляет контекст и перезапускает дебаунс.
+    """
+    text = message.text or message.caption
+    if not text:
+        return
+
+    logger.info("Жена отредактировала сообщение (ID %d): '%s'", WIFE_ID, text)
+
+    # Сохраняем отредактированное сообщение в контекстную историю
+    await save_chat_message(
+        sender_id=WIFE_ID,
+        text=f"(ред.) {text}",
+        sender_name="Жена",
+    )
+
+    if WIFE_ID in _debounce_tasks and not _debounce_tasks[WIFE_ID].done():
+        _debounce_tasks[WIFE_ID].cancel()
+
+    _debounce_tasks[WIFE_ID] = asyncio.create_task(
+        _debounced_process_messages(bot=bot, user_id=WIFE_ID)
+    )
+
+
+@router.business_message(F.from_user.id == MY_ID)
+async def handle_husband_business_message(message: types.Message) -> None:
+    """
+    Перехватывает реплики мужа в Business-чате с женой.
+    Сохраняет их в историю для полноты контекста, но НЕ запускает создание задач.
+    """
+    text = message.text or message.caption
+    if not text:
+        return
+
+    logger.debug("Сохранение реплики мужа в контекстную историю: '%s'", text)
+    await save_chat_message(
+        sender_id=MY_ID,
+        text=text,
+        sender_name="Муж",
+    )
+
+
+@router.business_connection()
+async def handle_business_connection(connection: types.BusinessConnection) -> None:
+    """
+    Служебный обработчик статуса подключения бота к Telegram Business.
+    """
+    logger.info(
+        "Статус Telegram Business подключения (ID %s): user_id=%d, can_reply=%s, is_enabled=%s",
+        connection.id,
+        connection.user.id,
+        connection.can_reply,
+        connection.is_enabled,
     )
 
 
