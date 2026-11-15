@@ -30,6 +30,10 @@ from voice.config import (
 )
 from voice.db import init_voice_db
 from voice.processor import process_voice_message
+from trello import (
+    TRELLO_ENABLED,
+    TrelloSyncService,
+)
 
 # ==============================================================================
 # КОНФИГУРАЦИЯ И КОНСТАНТЫ
@@ -73,6 +77,12 @@ logging.basicConfig(
 )
 logger = logging.getLogger("FamilyTasksBot")
 
+# Глобальный экземпляр бота (для асинхронных уведомлений из вебхуков/фоновых задач)
+_current_bot: Optional[Bot] = None
+
+# Сервис синхронизации задач с Trello
+trello_service = TrelloSyncService()
+
 # ==============================================================================
 # РАБОТА С БАЗОЙ ДАННЫХ SQLITE (aiosqlite)
 # ==============================================================================
@@ -109,6 +119,10 @@ async def init_db(db_path: Optional[str] = None) -> None:
             await db.execute("ALTER TABLE tasks ADD COLUMN description TEXT")
         if "updated_at" not in columns:
             await db.execute("ALTER TABLE tasks ADD COLUMN updated_at TEXT")
+        if "trello_card_id" not in columns:
+            await db.execute("ALTER TABLE tasks ADD COLUMN trello_card_id TEXT")
+        if "trello_card_url" not in columns:
+            await db.execute("ALTER TABLE tasks ADD COLUMN trello_card_url TEXT")
 
         # Таблица истории сообщений для контекстного анализа
         await db.execute(
@@ -180,7 +194,7 @@ async def get_latest_active_task(db_path: Optional[str] = None) -> Optional[Dict
         db.row_factory = aiosqlite.Row
         async with db.execute(
             """
-            SELECT id, title, description, deadline, status, created_at, updated_at
+            SELECT id, title, description, deadline, status, created_at, updated_at, trello_card_id, trello_card_url
             FROM tasks
             WHERE status IN ('pending', 'reminded')
             ORDER BY id DESC
@@ -198,7 +212,7 @@ async def get_task_by_id(task_id: int, db_path: Optional[str] = None) -> Optiona
         db.row_factory = aiosqlite.Row
         async with db.execute(
             """
-            SELECT id, title, description, deadline, status, created_at, updated_at
+            SELECT id, title, description, deadline, status, created_at, updated_at, trello_card_id, trello_card_url
             FROM tasks
             WHERE id = ?
             """,
@@ -235,6 +249,8 @@ async def update_task(
     description: Optional[str] = None,
     deadline: Optional[str] = None,
     status: Optional[str] = None,
+    trello_card_id: Optional[str] = None,
+    trello_card_url: Optional[str] = None,
     db_path: Optional[str] = None,
 ) -> bool:
     """Обновляет поля существующей задачи."""
@@ -255,6 +271,12 @@ async def update_task(
     if status is not None:
         fields.append("status = ?")
         values.append(status)
+    if trello_card_id is not None:
+        fields.append("trello_card_id = ?")
+        values.append(trello_card_id)
+    if trello_card_url is not None:
+        fields.append("trello_card_url = ?")
+        values.append(trello_card_url)
 
     values.append(task_id)
     query = f"UPDATE tasks SET {', '.join(fields)} WHERE id = ?"
@@ -263,6 +285,110 @@ async def update_task(
         cursor = await db.execute(query, values)
         await db.commit()
         return cursor.rowcount > 0
+
+
+async def update_task_trello_info(
+    task_id: int,
+    trello_card_id: str,
+    trello_card_url: str,
+    db_path: Optional[str] = None,
+) -> bool:
+    """Сохраняет привязку задачи к карточке Trello (card_id и url)."""
+    target_path = _get_db_path(db_path)
+    return await update_task(
+        task_id=task_id,
+        trello_card_id=trello_card_id,
+        trello_card_url=trello_card_url,
+        db_path=target_path,
+    )
+
+
+async def get_task_by_trello_card_id(
+    trello_card_id: str,
+    db_path: Optional[str] = None,
+) -> Optional[Dict[str, Any]]:
+    """Возвращает задачу по её ID карточки Trello."""
+    target_path = _get_db_path(db_path)
+    async with aiosqlite.connect(target_path) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            """
+            SELECT id, title, description, deadline, status, created_at, updated_at, trello_card_id, trello_card_url
+            FROM tasks
+            WHERE trello_card_id = ?
+            ORDER BY id DESC
+            LIMIT 1
+            """,
+            (trello_card_id,),
+        ) as cursor:
+            row = await cursor.fetchone()
+            return dict(row) if row else None
+
+
+async def find_active_task_for_trello_card(
+    card_id: str,
+    card_title: str,
+    db_path: Optional[str] = None,
+) -> Optional[Dict[str, Any]]:
+    """
+    Ищет активную задачу (status in 'pending', 'reminded') для карточки Trello:
+    1. По прямому совпадению trello_card_id.
+    2. По ID задачи в названии карточки (#123 или [#123]).
+    3. По точному совпадению названия задачи.
+    """
+    target_path = _get_db_path(db_path)
+    async with aiosqlite.connect(target_path) as db:
+        db.row_factory = aiosqlite.Row
+
+        # 1. По trello_card_id
+        if card_id:
+            async with db.execute(
+                """
+                SELECT id, title, description, deadline, status, created_at, updated_at, trello_card_id, trello_card_url
+                FROM tasks
+                WHERE trello_card_id = ? AND status IN ('pending', 'reminded')
+                ORDER BY id DESC LIMIT 1
+                """,
+                (card_id,),
+            ) as cursor:
+                row = await cursor.fetchone()
+                if row:
+                    return dict(row)
+
+        # 2. По ID в заголовке карточки (#12)
+        if card_title:
+            match = re.search(r"#(\d+)", card_title)
+            if match:
+                candidate_id = int(match.group(1))
+                async with db.execute(
+                    """
+                    SELECT id, title, description, deadline, status, created_at, updated_at, trello_card_id, trello_card_url
+                    FROM tasks
+                    WHERE id = ? AND status IN ('pending', 'reminded')
+                    LIMIT 1
+                    """,
+                    (candidate_id,),
+                ) as cursor:
+                    row = await cursor.fetchone()
+                    if row:
+                        return dict(row)
+
+            # 3. По названию задачи
+            clean_title = card_title.strip()
+            async with db.execute(
+                """
+                SELECT id, title, description, deadline, status, created_at, updated_at, trello_card_id, trello_card_url
+                FROM tasks
+                WHERE title = ? AND status IN ('pending', 'reminded')
+                ORDER BY id DESC LIMIT 1
+                """,
+                (clean_title,),
+            ) as cursor:
+                row = await cursor.fetchone()
+                if row:
+                    return dict(row)
+
+    return None
 
 
 async def update_task_status(
@@ -301,7 +427,7 @@ async def get_active_tasks(db_path: Optional[str] = None) -> List[Dict[str, Any]
         db.row_factory = aiosqlite.Row
         async with db.execute(
             """
-            SELECT id, title, description, deadline, status, created_at
+            SELECT id, title, description, deadline, status, created_at, trello_card_id, trello_card_url
             FROM tasks
             WHERE status IN ('pending', 'reminded')
             ORDER BY id DESC
@@ -739,6 +865,26 @@ async def process_recent_context_with_ollama(bot: Bot, user_id: int) -> None:
                 deadline_str=deadline_str,
             )
 
+        # Синхронизация с Trello (создание карточки в колонке Inbox)
+        trello_card_url = None
+        if trello_service and trello_service.is_enabled:
+            try:
+                card_data = await trello_service.sync_task_created(
+                    task_id=task_id,
+                    title=task_title,
+                    description=task_desc,
+                    deadline_dt=deadline_dt,
+                )
+                if card_data:
+                    await update_task_trello_info(
+                        task_id=task_id,
+                        trello_card_id=card_data["card_id"],
+                        trello_card_url=card_data.get("card_url", ""),
+                    )
+                    trello_card_url = card_data.get("card_url")
+            except Exception as e:
+                logger.error("Ошибка синхронизации созданной задачи #%d с Trello: %s", task_id, e)
+
         # Формируем уведомление для мужа
         if has_deadline and deadline_str:
             deadline_info = f"🕒 <code>{deadline_str}</code>"
@@ -750,12 +896,14 @@ async def process_recent_context_with_ollama(bot: Bot, user_id: int) -> None:
             deadline_info = "❌ Без дедлайна"
 
         desc_block = f"\n🔗 <b>Детали / ссылки:</b>\n{html.escape(task_desc)}\n" if task_desc else ""
+        trello_block = f"\n📋 <a href=\"{trello_card_url}\">Открыть карточку в Trello</a>\n" if trello_card_url else ""
 
         notification_text = (
             f"📥 <b>Новая задача от жены!</b>\n\n"
             f"📌 <b>Суть:</b> {html.escape(task_title)}"
             f"{desc_block}\n"
-            f"📅 <b>Дедлайн:</b> {deadline_info}\n\n"
+            f"📅 <b>Дедлайн:</b> {deadline_info}\n"
+            f"{trello_block}\n"
             f"<i>Запись сохранена в базу (ID: #{task_id})</i>"
         )
 
@@ -805,6 +953,19 @@ async def process_recent_context_with_ollama(bot: Bot, user_id: int) -> None:
         )
         logger.info("Задача #%d успешно обновлена новыми данными.", target_task_id)
 
+        # Синхронизация изменений в карточку Trello
+        if trello_service and trello_service.is_enabled and existing_task.get("trello_card_id"):
+            try:
+                await trello_service.sync_task_updated(
+                    task_id=target_task_id,
+                    trello_card_id=existing_task["trello_card_id"],
+                    title=final_title,
+                    description=final_desc,
+                    deadline_dt=deadline_dt,
+                )
+            except Exception as e:
+                logger.error("Ошибка обновления карточки Trello #%s: %s", existing_task["trello_card_id"], e)
+
         # Если дедлайн обновился — перепланируем напоминание в APScheduler
         if has_deadline and deadline_dt:
             await schedule_task_job(
@@ -831,6 +992,49 @@ async def process_recent_context_with_ollama(bot: Bot, user_id: int) -> None:
             await bot.send_message(chat_id=MY_ID, text=notification_text)
         except Exception as e:
             logger.error("Не удалось отправить уведомление об обновлении задачи: %s", e)
+
+
+async def handle_trello_card_completed(card_id: str, card_title: str) -> None:
+    """
+    Вызывается TrelloSyncService при получении вебхука или обнаружении карточки
+    в колонке Done/Завершено.
+    Находит соответствующую активную задачу, помечает её выполненной, снимает
+    напоминание из APScheduler и отправляет уведомление пользователю в Telegram.
+    """
+    task = await find_active_task_for_trello_card(card_id=card_id, card_title=card_title)
+    if not task:
+        logger.debug("Trello карточка %s ('%s') не привязана к активной задаче.", card_id, card_title)
+        return
+
+    task_id = task["id"]
+    task_title = task["title"]
+    logger.info("Задача #%d ('%s') завершена через Trello (card_id=%s)", task_id, task_title, card_id)
+
+    # Обновляем статус задачи в БД
+    await update_task_status(task_id, "completed")
+
+    # Снимаем таймер из планировщика, если он был зарегистрирован
+    job_id = f"task_reminder_{task_id}"
+    if scheduler.get_job(job_id):
+        scheduler.remove_job(job_id)
+
+    # Отправляем уведомление мужу (если bot доступен)
+    if _current_bot:
+        try:
+            await _current_bot.send_message(
+                chat_id=MY_ID,
+                text=(
+                    f"✅ <b>Задача #{task_id} выполнена в Trello!</b>\n\n"
+                    f"📌 <b>Суть:</b> {html.escape(task_title)}\n\n"
+                    f"<i>Карточка перемещена в колонку завершенных. Статус обновлен на 'completed'.</i>"
+                ),
+            )
+        except Exception as e:
+            logger.error(
+                "Ошибка при отправке уведомления в Telegram о выполнении задачи #%d из Trello: %s",
+                task_id,
+                e,
+            )
 
 
 async def _debounced_process_messages(bot: Bot, user_id: int) -> None:
@@ -980,6 +1184,7 @@ async def handle_business_connection(connection: types.BusinessConnection) -> No
 async def cmd_start(message: types.Message) -> None:
     """Информационное сообщение при старте бота."""
     asr_status = f"<b>включен</b> (<code>{ASR_MODEL_SIZE}</code>, <code>{ASR_DEVICE}</code>)" if ASR_ENABLED else "<b>выключен</b>"
+    trello_status = "<b>включена</b>" if (trello_service and trello_service.is_enabled) else "<b>выключена</b>"
     await message.answer(
         "👋 <b>Бот контекстного учета задач активен.</b>\n\n"
         "• Мониторинг Telegram Business: <b>включен</b>\n"
@@ -987,6 +1192,7 @@ async def cmd_start(message: types.Message) -> None:
         f"• ИИ-модель задач: <code>{OLLAMA_MODEL}</code>\n"
         f"• Локальный ASR (Whisper): {asr_status}\n"
         f"• Режим резюме голосовых: <code>{VOICE_SUMMARY_MODE}</code>\n"
+        f"• Синхронизация с Trello: {trello_status}\n"
         f"• Контекстное окно: <b>{CONTEXT_HISTORY_LIMIT} сообщений</b>\n"
         f"• Задержка дебаунса: <b>{DEBOUNCE_DELAY_SECONDS} с</b>\n\n"
         "Команды:\n"
@@ -1008,6 +1214,8 @@ async def cmd_tasks(message: types.Message) -> None:
         status_icon = "⏳" if t["status"] == "pending" else "⏰"
         dl = f" (до <code>{t['deadline']}</code>)" if t["deadline"] else " (без дедлайна)"
         item_text = f"{status_icon} <b>#{t['id']}</b>: {html.escape(t['title'])}{dl} [<code>{t['status']}</code>]"
+        if t.get("trello_card_url"):
+            item_text += f"\n   📋 <a href=\"{t['trello_card_url']}\">Карточка в Trello</a>"
         if t.get("description"):
             # Краткий предпросмотр деталей
             desc_preview = html.escape(t["description"])
@@ -1029,12 +1237,25 @@ async def cmd_done(message: types.Message) -> None:
         return
 
     task_id = int(args[1])
+    task = await get_task_by_id(task_id)
     await update_task_status(task_id, "completed")
 
     # Снимаем таймер из планировщика, если он ещё ждал дедлайна
     job_id = f"task_reminder_{task_id}"
     if scheduler.get_job(job_id):
         scheduler.remove_job(job_id)
+
+    # Если задача связана с карточкой Trello — перемещаем карточку в колонку Done
+    if trello_service and trello_service.is_enabled and task and task.get("trello_card_id"):
+        try:
+            if trello_service.done_list_ids:
+                done_list_id = next(iter(trello_service.done_list_ids))
+                await trello_service.client.update_card(
+                    card_id=task["trello_card_id"],
+                    list_id=done_list_id,
+                )
+        except Exception as e:
+            logger.error("Ошибка при перемещении карточки Trello в Done: %s", e)
 
     await message.answer(f"✅ Задача <b>#{task_id}</b> отмечена как выполненная!")
 
@@ -1046,6 +1267,8 @@ async def cmd_done(message: types.Message) -> None:
 
 async def on_startup(bot: Bot) -> None:
     """Действия при старте бота."""
+    global _current_bot
+    _current_bot = bot
     logger.info("Запуск бота...")
     await init_db(DB_PATH)
 
@@ -1053,12 +1276,22 @@ async def on_startup(bot: Bot) -> None:
     logger.info("Планировщик APScheduler запущен.")
 
     await restore_scheduled_jobs(bot, scheduler, DB_PATH)
+
+    # Инициализация и запуск сервиса синхронизации Trello
+    if trello_service and trello_service.is_enabled:
+        await trello_service.start(
+            scheduler=scheduler,
+            on_card_completed=handle_trello_card_completed,
+        )
+
     logger.info("Бот готов к обработке событий Telegram Business.")
 
 
 async def on_shutdown() -> None:
     """Корректное завершение работы бота."""
     logger.info("Остановка бота...")
+    if trello_service and trello_service.is_enabled:
+        await trello_service.stop()
     if scheduler.running:
         scheduler.shutdown(wait=False)
         logger.info("Планировщик APScheduler остановлен.")

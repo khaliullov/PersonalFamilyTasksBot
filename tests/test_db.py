@@ -71,6 +71,8 @@ async def test_legacy_database_migration(tmp_db):
     assert old_task["status"] == "pending"
     assert "description" in old_task
     assert "updated_at" in old_task
+    assert "trello_card_id" in old_task
+    assert "trello_card_url" in old_task
 
     # 4. Verify existing chat history was preserved
     history = await get_recent_chat_history(limit=5, db_path=tmp_db)
