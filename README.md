@@ -132,6 +132,15 @@ flowchart TD
 - **ПК / Сервер с NVIDIA GPU:** `ASR_DEVICE=cuda`, `ASR_COMPUTE_TYPE=float16` (требуется установленный CUDA Toolkit и cuDNN).
 - **Стандартный процессор x86_64:** `ASR_DEVICE=cpu`, `ASR_COMPUTE_TYPE=int8`.
 
+> [!IMPORTANT]
+> **Требования к версии Python для ASR (`faster-whisper`):**
+> Библиотека `faster-whisper` зависит от `onnxruntime` и `ctranslate2`, скомпилированные сборки которых на PyPI поддерживают версии **Python 3.9 – 3.12**.
+> Для распознавания голосовых сообщений используйте виртуальное окружение с Python 3.9–3.12 (например, через `pyenv` или `python3.11 -m venv .venv`). В репозитории уже настроено виртуальное окружение `.venv` на базе Python 3.9.2:
+> ```bash
+> source .venv/bin/activate
+> ```
+> Если бот запускается на Python 3.13+ без распознавания голоса, укажите в `.env`: `ASR_ENABLED=false`.
+
 ### Первичная загрузка модели:
 При первом входящем голосовом сообщении `faster-whisper` автоматически загрузит выбранную модель из репозитория Hugging Face и сохранит в локальный кэш (`~/.cache/huggingface/hub`). После этого интернет-соединение для транскрибации больше не требуется.
 

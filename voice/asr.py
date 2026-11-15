@@ -47,7 +47,18 @@ class WhisperTranscriber:
                         self.device,
                         self.compute_type,
                     )
-                    from faster_whisper import WhisperModel
+                    try:
+                        from faster_whisper import WhisperModel
+                    except ImportError as e:
+                        logger.error(
+                            "Пакет 'faster-whisper' не установлен в текущем окружении Python. "
+                            "Для распознавания голосовых используйте виртуальное окружение с Python 3.9-3.12 "
+                            "или отключите ASR, установив ASR_ENABLED=false в .env: %s",
+                            e,
+                        )
+                        raise RuntimeError(
+                            "faster-whisper не установлен. Используйте Python 3.9-3.12 или задайте ASR_ENABLED=false в .env."
+                        ) from e
 
                     self._model = WhisperModel(
                         self.model_size,
