@@ -226,12 +226,12 @@ async def process_voice_message(
                 len(transcript),
             )
         except Exception as e:
-            logger.error("Ошибка при ASR транскрибации сообщения #%d: %s", message_id, type(e).__name__)
+            logger.exception("Ошибка при ASR транскрибации сообщения #%d (%s): %s", message_id, type(e).__name__, e)
             await update_voice_message(
                 chat_id=chat_id,
                 telegram_message_id=message_id,
                 status="failed",
-                error_message=f"ASR failed: {type(e).__name__}",
+                error_message=f"ASR failed: {type(e).__name__}: {e}",
                 db_path=db_path,
             )
             return

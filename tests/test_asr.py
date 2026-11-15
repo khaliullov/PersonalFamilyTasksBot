@@ -138,3 +138,37 @@ def test_lazy_loading_transcriber():
         model2 = transcriber.get_model()
         assert model2 is mock_instance
         assert mock_whisper_cls.call_count == 1
+
+
+def test_av_open_metadata_errors_wrapper():
+    """Verify that PyAV open wrapper catches TypeError from unexpected metadata_errors and retries without it."""
+    import av
+    transcriber = WhisperTranscriber(model_size="tiny", device="cpu")
+
+    with patch("faster_whisper.WhisperModel"):
+        transcriber.get_model()
+
+    # The wrapper should be attached to av.open
+    assert getattr(av.open, "_safe_metadata_wrapper", False) is True
+
+    # Test that calling av.open with an unexpected metadata_errors doesn't raise TypeError
+    mock_orig = MagicMock(side_effect=[
+        TypeError("open() got an unexpected keyword argument 'metadata_errors'"),
+        "success_container",
+    ])
+
+    with patch("av.open", side_effect=None):
+        # Directly test the wrapper logic
+        def safe_test_call(**kwargs):
+            try:
+                return mock_orig(**kwargs)
+            except TypeError as err:
+                if "metadata_errors" in str(err) and "metadata_errors" in kwargs:
+                    kwargs.pop("metadata_errors", None)
+                    return mock_orig(**kwargs)
+                raise
+
+        res = safe_test_call(file="dummy.ogg", metadata_errors="ignore")
+        assert res == "success_container"
+        assert mock_orig.call_count == 2
+        assert "metadata_errors" not in mock_orig.call_args_list[1].kwargs

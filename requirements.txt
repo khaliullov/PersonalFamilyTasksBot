@@ -4,3 +4,4 @@ aiosqlite>=0.19.0
 apscheduler>=3.10.0,<4.0.0
 python-dotenv>=1.0.0
 faster-whisper>=1.0.0; python_version < "3.13"
+av<19; python_version < "3.13"

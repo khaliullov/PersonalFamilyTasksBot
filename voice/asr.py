@@ -60,6 +60,26 @@ class WhisperTranscriber:
                             "faster-whisper не установлен. Используйте Python 3.9-3.12 или задайте ASR_ENABLED=false в .env."
                         ) from e
 
+                    try:
+                        import av
+
+                        if hasattr(av, "open") and not getattr(av.open, "_safe_metadata_wrapper", False):
+                            _orig_av_open = av.open
+
+                            def _safe_av_open(*args, **kwargs):
+                                try:
+                                    return _orig_av_open(*args, **kwargs)
+                                except TypeError as err:
+                                    if "metadata_errors" in str(err) and "metadata_errors" in kwargs:
+                                        kwargs.pop("metadata_errors", None)
+                                        return _orig_av_open(*args, **kwargs)
+                                    raise
+
+                            _safe_av_open._safe_metadata_wrapper = True
+                            av.open = _safe_av_open
+                    except Exception as av_err:
+                        logger.debug("Не удалось применить патч совместимости для PyAV: %s", av_err)
+
                     self._model = WhisperModel(
                         self.model_size,
                         device=self.device,
@@ -153,5 +173,5 @@ async def transcribe_voice(
         )
         raise TimeoutError(f"ASR transcription timed out after {ASR_TIMEOUT_SECONDS}s")
     except Exception as e:
-        logger.error("Ошибка при распознавании речи ASR: %s", type(e).__name__)
+        logger.exception("Ошибка при распознавании речи ASR (%s): %s", type(e).__name__, e)
         raise
