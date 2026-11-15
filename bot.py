@@ -22,6 +22,15 @@ from aiogram.filters import Command, CommandStart
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.date import DateTrigger
 
+from voice.config import (
+    ASR_DEVICE,
+    ASR_ENABLED,
+    ASR_MODEL_SIZE,
+    VOICE_SUMMARY_MODE,
+)
+from voice.db import init_voice_db
+from voice.processor import process_voice_message
+
 # ==============================================================================
 # КОНФИГУРАЦИЯ И КОНСТАНТЫ
 # ==============================================================================
@@ -69,9 +78,15 @@ logger = logging.getLogger("FamilyTasksBot")
 # ==============================================================================
 
 
-async def init_db(db_path: str = DB_PATH) -> None:
-    """Инициализирует таблицы tasks и chat_history в базе данных SQLite."""
-    async with aiosqlite.connect(db_path) as db:
+def _get_db_path(db_path: Optional[str] = None) -> str:
+    """Возвращает переданный путь к БД или актуальное значение DB_PATH."""
+    return db_path if db_path is not None else DB_PATH
+
+
+async def init_db(db_path: Optional[str] = None) -> None:
+    """Инициализирует таблицы tasks, chat_history и voice_messages в базе данных SQLite."""
+    target_path = _get_db_path(db_path)
+    async with aiosqlite.connect(target_path) as db:
         # Таблица задач
         await db.execute(
             """
@@ -108,34 +123,42 @@ async def init_db(db_path: str = DB_PATH) -> None:
             """
         )
         await db.commit()
-    logger.info("База данных SQLite инициализирована (таблицы 'tasks' и 'chat_history' готовы).")
+
+        # Инициализация таблицы voice_messages и миграция chat_history
+        await init_voice_db(db)
+
+    logger.info("База данных SQLite инициализирована (таблицы 'tasks', 'chat_history' и 'voice_messages' готовы).")
 
 
 async def save_chat_message(
     sender_id: int,
     text: str,
     sender_name: str = "Жена",
-    db_path: str = DB_PATH,
+    source_message_id: Optional[int] = None,
+    message_type: str = "text",
+    db_path: Optional[str] = None,
 ) -> None:
     """Сохраняет сообщение в таблицу chat_history для последующего контекстного анализа."""
+    target_path = _get_db_path(db_path)
     created_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    async with aiosqlite.connect(db_path) as db:
+    async with aiosqlite.connect(target_path) as db:
         await db.execute(
             """
-            INSERT INTO chat_history (sender_id, sender_name, text, created_at)
-            VALUES (?, ?, ?, ?)
+            INSERT INTO chat_history (sender_id, sender_name, text, created_at, source_message_id, message_type)
+            VALUES (?, ?, ?, ?, ?, ?)
             """,
-            (sender_id, sender_name, text, created_at),
+            (sender_id, sender_name, text, created_at, source_message_id, message_type),
         )
         await db.commit()
 
 
 async def get_recent_chat_history(
     limit: int = CONTEXT_HISTORY_LIMIT,
-    db_path: str = DB_PATH,
+    db_path: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
     """Получает последние N сообщений в хронологическом порядке (от старых к новым)."""
-    async with aiosqlite.connect(db_path) as db:
+    target_path = _get_db_path(db_path)
+    async with aiosqlite.connect(target_path) as db:
         db.row_factory = aiosqlite.Row
         async with db.execute(
             """
@@ -150,9 +173,10 @@ async def get_recent_chat_history(
             return [dict(r) for r in reversed(rows)]
 
 
-async def get_latest_active_task(db_path: str = DB_PATH) -> Optional[Dict[str, Any]]:
+async def get_latest_active_task(db_path: Optional[str] = None) -> Optional[Dict[str, Any]]:
     """Получает последнюю активную задачу со статусом pending или reminded."""
-    async with aiosqlite.connect(db_path) as db:
+    target_path = _get_db_path(db_path)
+    async with aiosqlite.connect(target_path) as db:
         db.row_factory = aiosqlite.Row
         async with db.execute(
             """
@@ -167,9 +191,10 @@ async def get_latest_active_task(db_path: str = DB_PATH) -> Optional[Dict[str, A
             return dict(row) if row else None
 
 
-async def get_task_by_id(task_id: int, db_path: str = DB_PATH) -> Optional[Dict[str, Any]]:
+async def get_task_by_id(task_id: int, db_path: Optional[str] = None) -> Optional[Dict[str, Any]]:
     """Возвращает задачу по её первичному ключу ID."""
-    async with aiosqlite.connect(db_path) as db:
+    target_path = _get_db_path(db_path)
+    async with aiosqlite.connect(target_path) as db:
         db.row_factory = aiosqlite.Row
         async with db.execute(
             """
@@ -187,11 +212,12 @@ async def create_task(
     title: str,
     description: Optional[str] = None,
     deadline: Optional[str] = None,
-    db_path: str = DB_PATH,
+    db_path: Optional[str] = None,
 ) -> int:
     """Создает новую задачу в базе данных и возвращает её ID."""
+    target_path = _get_db_path(db_path)
     created_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    async with aiosqlite.connect(db_path) as db:
+    async with aiosqlite.connect(target_path) as db:
         cursor = await db.execute(
             """
             INSERT INTO tasks (title, description, deadline, status, created_at, updated_at)
@@ -209,9 +235,10 @@ async def update_task(
     description: Optional[str] = None,
     deadline: Optional[str] = None,
     status: Optional[str] = None,
-    db_path: str = DB_PATH,
+    db_path: Optional[str] = None,
 ) -> bool:
     """Обновляет поля существующей задачи."""
+    target_path = _get_db_path(db_path)
     updated_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     fields = ["updated_at = ?"]
     values: List[Any] = [updated_at]
@@ -232,7 +259,7 @@ async def update_task(
     values.append(task_id)
     query = f"UPDATE tasks SET {', '.join(fields)} WHERE id = ?"
 
-    async with aiosqlite.connect(db_path) as db:
+    async with aiosqlite.connect(target_path) as db:
         cursor = await db.execute(query, values)
         await db.commit()
         return cursor.rowcount > 0
@@ -241,18 +268,20 @@ async def update_task(
 async def update_task_status(
     task_id: int,
     status: str,
-    db_path: str = DB_PATH,
+    db_path: Optional[str] = None,
 ) -> None:
     """Обновляет только статус задачи (pending / reminded / completed)."""
-    await update_task(task_id=task_id, status=status, db_path=db_path)
+    target_path = _get_db_path(db_path)
+    await update_task(task_id=task_id, status=status, db_path=target_path)
     logger.info("Статус задачи #%d обновлен на '%s'.", task_id, status)
 
 
 async def get_pending_tasks_with_deadline(
-    db_path: str = DB_PATH,
+    db_path: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
     """Получает все незавершенные задачи с установленным дедлайном для APScheduler."""
-    async with aiosqlite.connect(db_path) as db:
+    target_path = _get_db_path(db_path)
+    async with aiosqlite.connect(target_path) as db:
         db.row_factory = aiosqlite.Row
         async with db.execute(
             """
@@ -265,9 +294,10 @@ async def get_pending_tasks_with_deadline(
             return [dict(row) for row in rows]
 
 
-async def get_active_tasks(db_path: str = DB_PATH) -> List[Dict[str, Any]]:
+async def get_active_tasks(db_path: Optional[str] = None) -> List[Dict[str, Any]]:
     """Получает список всех актуальных задач для вывода пользователю."""
-    async with aiosqlite.connect(db_path) as db:
+    target_path = _get_db_path(db_path)
+    async with aiosqlite.connect(target_path) as db:
         db.row_factory = aiosqlite.Row
         async with db.execute(
             """
@@ -528,14 +558,15 @@ async def send_task_reminder(
     title: str,
     deadline_str: str,
     my_id: int = MY_ID,
-    db_path: str = DB_PATH,
+    db_path: Optional[str] = None,
 ) -> None:
     """
     Callback-функция для APScheduler: отправляет уведомление пользователю MY_ID,
     когда наступает дедлайн задачи, и обновляет статус задачи в базе данных.
     """
+    target_path = _get_db_path(db_path)
     logger.info("Срабатывание напоминания по дедлайну для задачи #%d ('%s')", task_id, title)
-    task = await get_task_by_id(task_id, db_path=db_path)
+    task = await get_task_by_id(task_id, db_path=target_path)
     description = task.get("description") if task else None
 
     desc_block = f"\n🔗 <b>Детали:</b>\n{html.escape(description)}\n" if description else ""
@@ -550,7 +581,7 @@ async def send_task_reminder(
 
     try:
         await bot.send_message(chat_id=my_id, text=message_text)
-        await update_task_status(task_id, "reminded", db_path)
+        await update_task_status(task_id, "reminded", target_path)
     except Exception as e:
         logger.error("Ошибка при отправке напоминания в Telegram (chat_id=%d): %s", my_id, e)
 
@@ -594,12 +625,13 @@ async def schedule_task_job(
 async def restore_scheduled_jobs(
     bot: Bot,
     scheduler_instance: AsyncIOScheduler,
-    db_path: str = DB_PATH,
+    db_path: Optional[str] = None,
 ) -> None:
     """
     Восстанавливает активные напоминания из SQLite при перезапуске бота.
     """
-    pending_tasks = await get_pending_tasks_with_deadline(db_path)
+    target_path = _get_db_path(db_path)
+    pending_tasks = await get_pending_tasks_with_deadline(target_path)
     restored_count = 0
     now = datetime.now()
 
@@ -815,6 +847,17 @@ async def _debounced_process_messages(bot: Bot, user_id: int) -> None:
         await process_recent_context_with_ollama(bot=bot, user_id=user_id)
 
 
+def reset_debounce_timer(user_id: int, bot: Bot) -> None:
+    """Сбрасывает таймер дебаунса для указанного пользователя и регистрирует новую отложенную задачу."""
+    if user_id in _debounce_tasks and not _debounce_tasks[user_id].done():
+        _debounce_tasks[user_id].cancel()
+        logger.debug("Сброшен предыдущий таймер дебаунса для user_id=%d.", user_id)
+
+    _debounce_tasks[user_id] = asyncio.create_task(
+        _debounced_process_messages(bot=bot, user_id=user_id)
+    )
+
+
 # ==============================================================================
 # ОБРАБОТЧИКИ СОБЫТИЙ TELEGRAM (aiogram 3)
 # ==============================================================================
@@ -826,31 +869,45 @@ router = Router(name="business_task_router")
 async def handle_wife_business_message(message: types.Message, bot: Bot) -> None:
     """
     Перехватывает сообщения из Telegram Business чата с жестким фильтром по WIFE_ID.
-    Сохраняет сообщения в контекстную историю и запускает таймер дебаунса.
+    Поддерживает как текстовые, так и голосовые сообщения.
     """
+    if message.from_user and message.from_user.id != WIFE_ID:
+        logger.debug("Сообщение не от WIFE_ID, игнорируем.")
+        return
+
+    # 1. Голосовые сообщения
+    if message.voice:
+        logger.info("Получено голосовое сообщение от жены (ID %d).", WIFE_ID)
+        await process_voice_message(
+            message=message,
+            bot=bot,
+            save_chat_message_fn=save_chat_message,
+            reset_debounce_fn=lambda uid: reset_debounce_timer(uid, bot),
+            db_path=DB_PATH,
+            ollama_url=OLLAMA_URL,
+            ollama_model=OLLAMA_MODEL,
+            ollama_timeout=OLLAMA_TIMEOUT_SECONDS,
+        )
+        return
+
     text = message.text or message.caption
     if not text:
         logger.debug("Получено сообщение от жены без текста (стикер/медиа без подписи), игнорируем.")
         return
 
-    logger.info("Получено сообщение от жены (ID %d): '%s'", WIFE_ID, text)
+    logger.info("Получено текстовое сообщение от жены (ID %d): '%s'", WIFE_ID, text)
 
-    # 1. Сохраняем сообщение в историю чата для контекстного окна
+    # 2. Сохраняем текстовое сообщение в историю чата для контекстного окна
     await save_chat_message(
         sender_id=WIFE_ID,
         text=text,
         sender_name="Жена",
+        source_message_id=message.message_id,
+        message_type="text",
     )
 
-    # 2. Дебаунс: сбрасываем предыдущий таймер, если жена пишет серию сообщений подряд
-    if WIFE_ID in _debounce_tasks and not _debounce_tasks[WIFE_ID].done():
-        _debounce_tasks[WIFE_ID].cancel()
-        logger.debug("Сброшен предыдущий таймер дебаунса для WIFE_ID.")
-
-    # 3. Регистрируем новую отложенную задачу обработки
-    _debounce_tasks[WIFE_ID] = asyncio.create_task(
-        _debounced_process_messages(bot=bot, user_id=WIFE_ID)
-    )
+    # 3. Дебаунс: сбрасываем предыдущий таймер, если жена пишет серию сообщений подряд
+    reset_debounce_timer(WIFE_ID, bot)
 
 
 @router.edited_business_message(F.from_user.id == WIFE_ID)
@@ -859,6 +916,9 @@ async def handle_wife_edited_business_message(message: types.Message, bot: Bot) 
     Перехватывает отредактированные сообщения от жены в Telegram Business.
     Обновляет контекст и перезапускает дебаунс.
     """
+    if message.from_user and message.from_user.id != WIFE_ID:
+        return
+
     text = message.text or message.caption
     if not text:
         return
@@ -870,14 +930,11 @@ async def handle_wife_edited_business_message(message: types.Message, bot: Bot) 
         sender_id=WIFE_ID,
         text=f"(ред.) {text}",
         sender_name="Жена",
+        source_message_id=message.message_id,
+        message_type="text",
     )
 
-    if WIFE_ID in _debounce_tasks and not _debounce_tasks[WIFE_ID].done():
-        _debounce_tasks[WIFE_ID].cancel()
-
-    _debounce_tasks[WIFE_ID] = asyncio.create_task(
-        _debounced_process_messages(bot=bot, user_id=WIFE_ID)
-    )
+    reset_debounce_timer(WIFE_ID, bot)
 
 
 @router.business_message(F.from_user.id == MY_ID)
@@ -895,6 +952,8 @@ async def handle_husband_business_message(message: types.Message) -> None:
         sender_id=MY_ID,
         text=text,
         sender_name="Муж",
+        source_message_id=message.message_id,
+        message_type="text",
     )
 
 
@@ -920,11 +979,14 @@ async def handle_business_connection(connection: types.BusinessConnection) -> No
 @router.message(CommandStart(), F.from_user.id == MY_ID)
 async def cmd_start(message: types.Message) -> None:
     """Информационное сообщение при старте бота."""
+    asr_status = f"<b>включен</b> (<code>{ASR_MODEL_SIZE}</code>, <code>{ASR_DEVICE}</code>)" if ASR_ENABLED else "<b>выключен</b>"
     await message.answer(
         "👋 <b>Бот контекстного учета задач активен.</b>\n\n"
         "• Мониторинг Telegram Business: <b>включен</b>\n"
         f"• Отслеживаемый WIFE_ID: <code>{WIFE_ID}</code>\n"
-        f"• ИИ-модель: <code>{OLLAMA_MODEL}</code>\n"
+        f"• ИИ-модель задач: <code>{OLLAMA_MODEL}</code>\n"
+        f"• Локальный ASR (Whisper): {asr_status}\n"
+        f"• Режим резюме голосовых: <code>{VOICE_SUMMARY_MODE}</code>\n"
         f"• Контекстное окно: <b>{CONTEXT_HISTORY_LIMIT} сообщений</b>\n"
         f"• Задержка дебаунса: <b>{DEBOUNCE_DELAY_SECONDS} с</b>\n\n"
         "Команды:\n"
