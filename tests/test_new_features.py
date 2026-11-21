@@ -79,14 +79,29 @@ def test_parse_deadline_iso_with_z_converts_to_bot_timezone():
 
 
 def test_get_task_inline_keyboard():
-    """Проверяет корректность разметки inline клавиатуры для задачи."""
+    """Проверяет корректность разметки inline клавиатуры для задачи (кнопки Завершить и В календарь)."""
+    # По умолчанию: есть обе кнопки: [✅ Завершить] и [📅 В календарь]
     kb = bot_module.get_task_inline_keyboard(42)
     assert kb is not None
     assert len(kb.inline_keyboard) == 1
-    assert len(kb.inline_keyboard[0]) == 1
-    button = kb.inline_keyboard[0][0]
-    assert button.callback_data == "done:42"
-    assert "Завершить" in button.text
+    assert len(kb.inline_keyboard[0]) == 2
+    b1 = kb.inline_keyboard[0][0]
+    b2 = kb.inline_keyboard[0][1]
+    assert b1.callback_data == "done:42"
+    assert "Завершить" in b1.text
+    assert b2.callback_data == "to_calendar:42"
+    assert "В календарь" in b2.text
+
+    # Если уже в календаре
+    kb_cal = bot_module.get_task_inline_keyboard(42, show_calendar_button=False, is_in_calendar=True)
+    assert len(kb_cal.inline_keyboard[0]) == 2
+    assert kb_cal.inline_keyboard[0][1].callback_data == "noop_cal"
+    assert "В календаре" in kb_cal.inline_keyboard[0][1].text
+
+    # Без кнопки календаря
+    kb_only_done = bot_module.get_task_inline_keyboard(42, show_calendar_button=False, is_in_calendar=False)
+    assert len(kb_only_done.inline_keyboard[0]) == 1
+    assert kb_only_done.inline_keyboard[0][0].callback_data == "done:42"
 
 
 @pytest.mark.asyncio
@@ -173,7 +188,9 @@ async def test_cmd_tasks_includes_inline_buttons(initialized_db):
     assert reply_markup is not None
     assert len(reply_markup.inline_keyboard) == 2
     assert reply_markup.inline_keyboard[0][0].callback_data == f"done:{t2}"
+    assert reply_markup.inline_keyboard[0][1].callback_data == f"to_calendar:{t2}"
     assert reply_markup.inline_keyboard[1][0].callback_data == f"done:{t1}"
+    assert reply_markup.inline_keyboard[1][1].callback_data == f"to_calendar:{t1}"
 
 
 # ==============================================================================
@@ -458,3 +475,161 @@ async def test_trello_webhook_update_card_triggers_on_card_updated():
     await service.handle_webhook_payload(payload)
     assert len(updated_cards) == 1
     assert updated_cards[0] == ("card_updated_wh", "Новый заголовок")
+
+
+# ==============================================================================
+# 6. ТЕСТЫ КНОПКИ «В КАЛЕНДАРЬ» И ОПРЕДЕЛЕНИЯ ДАТЫ СОБЫТИЯ
+# ==============================================================================
+
+
+def test_resolve_event_datetime_from_deadline():
+    """Проверяет определение даты события по имеющемуся deadline в БД."""
+    task = {
+        "title": "Отвезти Лену в 19:30 и взять Данию с собой",
+        "deadline": "2026-11-21 19:30:00",
+        "description": None,
+    }
+    dt = bot_module.resolve_event_datetime(task)
+    assert dt.year == 2026
+    assert dt.month == 11
+    assert dt.day == 21
+    assert dt.hour == 19
+    assert dt.minute == 30
+    assert dt.tzinfo is not None
+
+
+def test_resolve_event_datetime_from_title_time():
+    """Проверяет извлечение времени из названия задачи при отсутствии дедлайна."""
+    task = {
+        "title": "Отвезти Лену в 19:30 и взять Данию с собой",
+        "deadline": None,
+        "description": None,
+    }
+    dt = bot_module.resolve_event_datetime(task)
+    assert dt.hour == 19
+    assert dt.minute == 30
+    assert dt.tzinfo is not None
+
+
+def test_resolve_event_datetime_from_title_date_and_time():
+    """Проверяет извлечение даты и времени (например: 'Идем к врачу 25 ноября в 9:00')."""
+    task = {
+        "title": "Идем к врачу 25 ноября в 9:00",
+        "deadline": None,
+        "description": "Адрес клиники: ул. Пушкина 10",
+    }
+    dt = bot_module.resolve_event_datetime(task)
+    assert dt.day == 25
+    assert dt.month == 11
+    assert dt.hour == 9
+    assert dt.minute == 0
+
+
+def test_resolve_event_datetime_fallback():
+    """Проверяет резервный расчет времени (ближайший круглый час) при отсутствии временных меток."""
+    task = {
+        "title": "Купить продукты к ужину",
+        "deadline": None,
+        "description": None,
+    }
+    dt = bot_module.resolve_event_datetime(task)
+    assert dt.minute == 0
+    assert dt.second == 0
+    assert dt.tzinfo is not None
+
+
+@pytest.mark.asyncio
+async def test_callback_to_calendar_adds_event_and_updates_db(initialized_db):
+    """
+    Проверяет сценарий ложного срабатывания ИИ: задача создана как 'task',
+    пользователь нажимает «📅 В календарь», задача переводится в 'calendar',
+    создается событие в Apple Calendar (CalDAV), и обновляются кнопки.
+    """
+    task_id = await bot_module.create_task(
+        title="Отвезти Лену в 19:30 и взять Данию с собой",
+        deadline="2026-11-21 19:30:00",
+        category="task",
+        db_path=initialized_db,
+    )
+
+    mock_cal_service = AsyncMock(spec=CalendarSyncService)
+    mock_cal_service.is_enabled = True
+    mock_cal_service.create_event.return_value = {
+        "uid": "cal_event_uid_133",
+        "url": "https://caldav.apple.com/events/133.ics",
+    }
+
+    callback = AsyncMock()
+    callback.data = f"to_calendar:{task_id}"
+    callback.message = AsyncMock()
+    callback.answer = AsyncMock()
+
+    with patch.object(bot_module, "DB_PATH", initialized_db), \
+         patch.object(bot_module, "calendar_service", mock_cal_service):
+
+        await bot_module.callback_to_calendar(callback)
+
+    # 1. Проверяем вызов сервиса календаря
+    mock_cal_service.create_event.assert_called_once()
+    call_kwargs = mock_cal_service.create_event.call_args.kwargs
+    assert call_kwargs["title"] == "Отвезти Лену в 19:30 и взять Данию с собой"
+    assert call_kwargs["start_dt"].hour == 19
+    assert call_kwargs["start_dt"].minute == 30
+
+    # 2. Проверяем сохранение категории и CalDAV данных в SQLite
+    task = await bot_module.get_task_by_id(task_id, db_path=initialized_db)
+    assert task["category"] == "calendar"
+    assert task["caldav_uid"] == "cal_event_uid_133"
+    assert task["caldav_url"] == "https://caldav.apple.com/events/133.ics"
+
+    # 3. Проверяем уведомление и замену кнопок под сообщением
+    callback.answer.assert_called_once()
+    assert "Добавлено в Apple Calendar" in callback.answer.call_args.args[0]
+    callback.message.edit_reply_markup.assert_called_once()
+
+    updated_markup = callback.message.edit_reply_markup.call_args.kwargs.get("reply_markup")
+    assert updated_markup is not None
+    # Первая кнопка - Завершить, вторая - [🗓 В календаре] (заглушка noop_cal)
+    assert updated_markup.inline_keyboard[0][0].callback_data == f"done:{task_id}"
+    assert updated_markup.inline_keyboard[0][1].callback_data == "noop_cal"
+    assert "В календаре" in updated_markup.inline_keyboard[0][1].text
+
+
+@pytest.mark.asyncio
+async def test_callback_to_calendar_already_in_calendar(initialized_db):
+    """Проверяет, что повторное нажатие не создает дубликатов в CalDAV."""
+    task_id = await bot_module.create_task(
+        title="Событие уже в календаре",
+        category="calendar",
+        caldav_uid="existing_uid_999",
+        db_path=initialized_db,
+    )
+
+    mock_cal_service = AsyncMock(spec=CalendarSyncService)
+    mock_cal_service.is_enabled = True
+
+    callback = AsyncMock()
+    callback.data = f"to_calendar:{task_id}"
+    callback.message = AsyncMock()
+    callback.answer = AsyncMock()
+
+    with patch.object(bot_module, "DB_PATH", initialized_db), \
+         patch.object(bot_module, "calendar_service", mock_cal_service):
+
+        await bot_module.callback_to_calendar(callback)
+
+    # Сервис не должен вызываться повторно
+    mock_cal_service.create_event.assert_not_called()
+    callback.answer.assert_called_once()
+    assert "уже занесено" in callback.answer.call_args.args[0]
+
+
+@pytest.mark.asyncio
+async def test_callback_noop_cal():
+    """Проверяет всплывающий ответ для кнопки '🗓 В календаре'."""
+    callback = AsyncMock()
+    callback.answer = AsyncMock()
+
+    await bot_module.callback_noop_cal(callback)
+    callback.answer.assert_called_once()
+    assert "уже занесено" in callback.answer.call_args.args[0]

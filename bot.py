@@ -1,5 +1,5 @@
 import asyncio
-from datetime import datetime
+from datetime import datetime, time, timedelta
 import html
 import json
 import logging
@@ -622,12 +622,13 @@ def build_prompt(
    - Обычный разговор, эмоции, благодарность ("спасибо!", "люблю"), вопрос без поручения ("ты где?"), мем или приветствие.
 
 КАТЕГОРИИ (поле "category"):
-- "calendar": Явные события, встречи, визиты к врачу/специалисту, записи на прием, процедуры, видеосозвоны или мероприятия, привязанные к конкретной дате и времени (например: «Идем к остеопату 25 ноября в 9:00», «Завтра созвон в Zoom в 15:00 https://zoom.us/...», «Запись к стоматологу в пятницу в 11:30», «Врач Иванова +79991234567 ул. Пушкина 10»).
+- "calendar": Любые события, поездки, встречи, приемы врачей/специалистов, записи, процедуры, видеосозвоны или поручения, привязанные к ТОЧНОМУ ВРЕМЕНИ ДНЯ или расписанию (например: «Отвезти Лену в 19:30 и взять Данию с собой», «Забрать ребенка в 18:00», «Идем к остеопату 25 ноября в 9:00», «Завтра созвон в Zoom в 15:00 https://zoom.us/...», «Запись к стоматологу в пятницу в 11:30», «Выехать в аэропорт в 06:30»).
+  Если действие или поездка привязаны к конкретному часу/минутам встречи или выезда — это ВСЕГДА "calendar".
   Для таких событий ОБЯЗАТЕЛЬНО укажи deadline_timestamp (время начала события), а также при наличии в тексте:
   * "location": место встречи или точный адрес (например: "ул. Пушкина 10", "Клиника Остеомед", null если не указано)
   * "meeting_url": ссылка для онлайн-встречи (Zoom, Google Meet, Яндекс Телемост и т.п., null если не указано)
   * "contact_info": контактное лицо и/или номер телефона (например: "доктор Иванова +79991234567", null если не указано)
-- "task": Обычные дела, бытовые поручения, покупки или задачи без формата конкретной встречи/события (например: «Купить молоко», «Забрать посылку из СДЭК», «Выбрать подарок сыну»).
+- "task": Обычные бытовые дела, поручения, покупки или задачи без привязки к конкретному часу встречи/выезда (например: «Купить молоко», «Забрать посылку из СДЭК до конца недели», «Выбрать подарок сыну»).
 
 ТРЕБОВАНИЯ К ФОРМАТУ ОТВЕТА:
 Строго верни валидный JSON без markdown-разметки и вводных слов по схеме:
@@ -818,19 +819,152 @@ def parse_deadline(
 
 scheduler = AsyncIOScheduler(timezone=BOT_TIMEZONE)
 
+_MONTHS_MAP: Dict[str, int] = {
+    "янв": 1, "января": 1, "январе": 1,
+    "фев": 2, "февраля": 2, "феврале": 2,
+    "мар": 3, "марта": 3, "марте": 3,
+    "апр": 4, "апреля": 4, "апреле": 4,
+    "май": 5, "мая": 5, "мае": 5,
+    "июн": 6, "июня": 6, "июне": 6,
+    "июл": 7, "июля": 7, "июле": 7,
+    "авг": 8, "августа": 8, "августе": 8,
+    "сен": 9, "сентября": 9, "сентябре": 9,
+    "окт": 10, "октября": 10, "октябре": 10,
+    "ноя": 11, "ноября": 11, "ноябре": 11,
+    "дек": 12, "декабря": 12, "декабре": 12,
+}
 
-def get_task_inline_keyboard(task_id: int) -> types.InlineKeyboardMarkup:
-    """Формирует inline клавиатуру с кнопкой быстрого завершения задачи."""
-    return types.InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                types.InlineKeyboardButton(
-                    text="✅ Завершить",
-                    callback_data=f"done:{task_id}",
-                )
-            ]
-        ]
+
+def resolve_event_datetime(
+    task: Dict[str, Any],
+    tz: Optional[Any] = None,
+) -> datetime:
+    """
+    Определяет дату и время события для календаря:
+    1. Если у задачи уже есть deadline — парсит его с привязкой к часовому поясу бота.
+    2. Если дедлайна нет — пытается извлечь время и дату из заголовка или описания задачи.
+    3. При отсутствии временных ориентиров берет ближайший круглый час.
+    """
+    target_tz = tz or BOT_TIMEZONE
+    if task.get("deadline"):
+        dt = parse_deadline(task["deadline"], tz=target_tz)
+        if dt:
+            return dt
+
+    now = get_now()
+    text = f"{task.get('title', '')} {task.get('description', '')}".strip()
+    text_lower = text.lower()
+
+    # 1. Смещение по ключевым словам
+    days_ahead = 0
+    if "послезавтра" in text_lower:
+        days_ahead = 2
+    elif "завтра" in text_lower:
+        days_ahead = 1
+
+    # 2. Поиск даты (например, "25 ноября" или "25.11")
+    target_day: Optional[int] = None
+    target_month: Optional[int] = None
+    target_year: int = now.year
+
+    date_month_match = re.search(
+        r"\b(\d{1,2})\s+(январ[яе]|феврал[яе]|март[ае]|апрел[яе]|ма[яе]|июн[яе]|июл[яе]|август[ае]|сентябр[яе]|октябр[яе]|ноябр[яе]|декабр[яе])\b",
+        text_lower,
     )
+    if date_month_match:
+        target_day = int(date_month_match.group(1))
+        m_word = date_month_match.group(2)
+        target_month = _MONTHS_MAP.get(m_word, _MONTHS_MAP.get(m_word[:3]))
+        if target_month and target_month < now.month:
+            target_year += 1
+    else:
+        date_dot_match = re.search(r"\b(\d{1,2})\.(\d{1,2})(?:\.(\d{2,4}))?\b", text_lower)
+        if date_dot_match:
+            target_day = int(date_dot_match.group(1))
+            target_month = int(date_dot_match.group(2))
+            if date_dot_match.group(3):
+                y = int(date_dot_match.group(3))
+                target_year = y if y > 100 else 2000 + y
+            elif target_month < now.month:
+                target_year += 1
+
+    # 3. Поиск времени (например: "в 19:30", "в 19.30", "в 9:00", "в 18")
+    target_hour: Optional[int] = None
+    target_minute: int = 0
+
+    time_match = re.search(
+        r"(?:^|[^\d])(?:в|к|на|at)\s*(\d{1,2})(?:[:.](\d{2}))?(?:\s*(утра|вечера|дня))?\b",
+        text_lower,
+    )
+    if time_match:
+        target_hour = int(time_match.group(1))
+        if time_match.group(2):
+            target_minute = int(time_match.group(2))
+        tod = time_match.group(3)
+        if tod == "вечера" and target_hour < 12:
+            target_hour += 12
+        elif tod == "дня" and target_hour < 12 and target_hour != 12:
+            target_hour += 12
+        elif tod == "утра" and target_hour == 12:
+            target_hour = 0
+
+    # 4. Сборка итогового datetime
+    if target_day and target_month:
+        hour = target_hour if target_hour is not None else 10
+        minute = target_minute
+        try:
+            return datetime(target_year, target_month, target_day, hour, minute, tzinfo=target_tz)
+        except ValueError:
+            pass
+
+    if target_hour is not None:
+        target_date = (now + timedelta(days=days_ahead)).date()
+        candidate = datetime(
+            target_date.year,
+            target_date.month,
+            target_date.day,
+            target_hour,
+            target_minute,
+            tzinfo=target_tz,
+        )
+        if days_ahead == 0 and candidate < now - timedelta(hours=2):
+            candidate += timedelta(days=1)
+        return candidate
+
+    # 5. Резервный вариант: следующий круглый час
+    return (now + timedelta(hours=1)).replace(minute=0, second=0, microsecond=0)
+
+
+def get_task_inline_keyboard(
+    task_id: int,
+    show_calendar_button: bool = True,
+    is_in_calendar: bool = False,
+) -> types.InlineKeyboardMarkup:
+    """
+    Формирует inline клавиатуру с кнопкой быстрого завершения задачи
+    и кнопкой добавления в календарь.
+    """
+    buttons = [
+        types.InlineKeyboardButton(
+            text="✅ Завершить",
+            callback_data=f"done:{task_id}",
+        )
+    ]
+    if show_calendar_button:
+        buttons.append(
+            types.InlineKeyboardButton(
+                text="📅 В календарь",
+                callback_data=f"to_calendar:{task_id}",
+            )
+        )
+    elif is_in_calendar:
+        buttons.append(
+            types.InlineKeyboardButton(
+                text="🗓 В календаре",
+                callback_data="noop_cal",
+            )
+        )
+    return types.InlineKeyboardMarkup(inline_keyboard=[buttons])
 
 
 async def send_task_reminder(
@@ -882,11 +1016,16 @@ async def send_task_reminder(
         f"<i>#{task_id} ожидает выполнения. Для завершения нажмите кнопку ниже:</i>"
     )
 
+    in_cal = bool(task.get("caldav_uid")) if task else False
     try:
         await bot.send_message(
             chat_id=my_id,
             text=message_text,
-            reply_markup=get_task_inline_keyboard(task_id),
+            reply_markup=get_task_inline_keyboard(
+                task_id,
+                show_calendar_button=not in_cal,
+                is_in_calendar=in_cal,
+            ),
         )
         await update_task_status(task_id, "reminded", target_path)
     except Exception as e:
@@ -1151,11 +1290,16 @@ async def process_recent_context_with_ollama(bot: Bot, user_id: int) -> None:
                 f"<i>Запись сохранена в базу (ID: #{task_id})</i>"
             )
 
+        in_cal = bool(caldav_info)
         try:
             await bot.send_message(
                 chat_id=MY_ID,
                 text=notification_text,
-                reply_markup=get_task_inline_keyboard(task_id),
+                reply_markup=get_task_inline_keyboard(
+                    task_id,
+                    show_calendar_button=not in_cal,
+                    is_in_calendar=in_cal,
+                ),
             )
         except Exception as e:
             logger.error("Не удалось отправить уведомление о создании задачи в Telegram: %s", e)
@@ -1242,11 +1386,16 @@ async def process_recent_context_with_ollama(bot: Bot, user_id: int) -> None:
             f"<i>Данные задачи актуализированы на основе новых сообщений.</i>"
         )
 
+        in_cal = bool(existing_task.get("caldav_uid"))
         try:
             await bot.send_message(
                 chat_id=MY_ID,
                 text=notification_text,
-                reply_markup=get_task_inline_keyboard(target_task_id),
+                reply_markup=get_task_inline_keyboard(
+                    target_task_id,
+                    show_calendar_button=not in_cal,
+                    is_in_calendar=in_cal,
+                ),
             )
         except Exception as e:
             logger.error("Не удалось отправить уведомление об обновлении задачи: %s", e)
@@ -1598,12 +1747,27 @@ async def cmd_tasks(message: types.Message) -> None:
         lines.append(item_text)
 
         btn_title = t["title"][:25] + ("..." if len(t["title"]) > 25 else "")
-        keyboard_buttons.append([
+        row = [
             types.InlineKeyboardButton(
                 text=f"✅ #{t['id']} {btn_title}",
                 callback_data=f"done:{t['id']}",
             )
-        ])
+        ]
+        if not t.get("caldav_uid"):
+            row.append(
+                types.InlineKeyboardButton(
+                    text="📅 В календарь",
+                    callback_data=f"to_calendar:{t['id']}",
+                )
+            )
+        else:
+            row.append(
+                types.InlineKeyboardButton(
+                    text="🗓 В календаре",
+                    callback_data="noop_cal",
+                )
+            )
+        keyboard_buttons.append(row)
 
     lines.append("\n<i>Нажмите на inline-кнопку под сообщением или отправьте: /done &lt;id&gt;</i>")
     reply_markup = types.InlineKeyboardMarkup(inline_keyboard=keyboard_buttons) if keyboard_buttons else None
@@ -1676,6 +1840,107 @@ async def callback_done_task(callback: types.CallbackQuery) -> None:
 async def callback_noop(callback: types.CallbackQuery) -> None:
     """Заглушка для уже завершенных inline-кнопок."""
     await callback.answer("Эта задача уже отмечена как выполненная.", show_alert=False)
+
+
+@router.callback_query(F.data.startswith("to_calendar:"))
+async def callback_to_calendar(
+    callback: types.CallbackQuery,
+    db_path: Optional[str] = None,
+) -> None:
+    """
+    Обработчик нажатия на inline кнопку «📅 В календарь».
+    Позволяет перенести задачу в категорию 'calendar' и добавить её в Apple Calendar (CalDAV),
+    если ИИ ошибся при автоматической классификации.
+    """
+    data = callback.data or ""
+    parts = data.split(":")
+    if len(parts) < 2 or not parts[1].isdigit():
+        await callback.answer("Некорректный ID задачи.", show_alert=True)
+        return
+
+    task_id = int(parts[1])
+    target_path = _get_db_path(db_path)
+    task = await get_task_by_id(task_id, db_path=target_path)
+    if not task:
+        await callback.answer(f"Задача #{task_id} не найдена.", show_alert=True)
+        return
+
+    if task.get("status") == "completed":
+        await callback.answer(f"Задача #{task_id} уже выполнена!", show_alert=True)
+        return
+
+    if task.get("caldav_uid"):
+        await callback.answer("Это событие уже занесено в Apple Calendar.", show_alert=False)
+        try:
+            if callback.message:
+                cal_markup = get_task_inline_keyboard(task_id, show_calendar_button=False, is_in_calendar=True)
+                await callback.message.edit_reply_markup(reply_markup=cal_markup)
+        except Exception:
+            pass
+        return
+
+    # Определяем дату и время начала события
+    start_dt = resolve_event_datetime(task)
+    new_deadline_str = start_dt.strftime("%Y-%m-%d %H:%M:%S")
+
+    caldav_info = None
+    if calendar_service and calendar_service.is_enabled:
+        try:
+            caldav_info = await calendar_service.create_event(
+                title=task["title"],
+                start_dt=start_dt,
+                location=task.get("location"),
+                description=task.get("description"),
+                meeting_url=task.get("meeting_url"),
+                contact_info=task.get("contact_info"),
+            )
+        except Exception as e:
+            logger.error("Ошибка при создании события в CalDAV для задачи #%d: %s", task_id, e)
+            await callback.answer("⚠️ Ошибка синхронизации с Apple Calendar.", show_alert=True)
+            return
+
+    caldav_uid = caldav_info["uid"] if caldav_info else None
+    caldav_url = caldav_info.get("url", "") if caldav_info else None
+
+    # Обновляем задачу в базе данных (категория -> calendar, caldav_uid, caldav_url)
+    await update_task(
+        task_id=task_id,
+        category="calendar",
+        deadline=new_deadline_str if not task.get("deadline") else None,
+        caldav_uid=caldav_uid,
+        caldav_url=caldav_url,
+        db_path=target_path,
+    )
+    logger.info("Задача #%d переведена в категорию 'calendar' (CalDAV UID: %s)", task_id, caldav_uid)
+
+    # Если дедлайн в будущем — планируем напоминание в APScheduler
+    if _current_bot and start_dt > get_now():
+        await schedule_task_job(
+            scheduler_instance=scheduler,
+            bot=_current_bot,
+            task_id=task_id,
+            title=task["title"],
+            deadline_dt=start_dt,
+            deadline_str=new_deadline_str,
+        )
+
+    if caldav_info:
+        await callback.answer("📅 Добавлено в Apple Calendar!", show_alert=False)
+    else:
+        await callback.answer("🗓 Категория обновлена на 'Календарь'. CalDAV не настроен.", show_alert=True)
+
+    try:
+        if callback.message:
+            cal_markup = get_task_inline_keyboard(task_id, show_calendar_button=False, is_in_calendar=True)
+            await callback.message.edit_reply_markup(reply_markup=cal_markup)
+    except Exception as e:
+        logger.debug("Не удалось обновить inline-кнопки после добавления в календарь: %s", e)
+
+
+@router.callback_query(F.data == "noop_cal")
+async def callback_noop_cal(callback: types.CallbackQuery) -> None:
+    """Заглушка для уже добавленных в календарь событий."""
+    await callback.answer("Это событие уже занесено в календарь.", show_alert=False)
 
 
 # ==============================================================================
