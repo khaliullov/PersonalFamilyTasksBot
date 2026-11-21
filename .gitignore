@@ -24,3 +24,6 @@ ENV/
 *.swp
 *.swo
 .DS_Store
+
+# Test cache
+.pytest_cache

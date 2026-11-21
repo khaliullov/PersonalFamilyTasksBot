@@ -81,6 +81,9 @@ class TrelloSyncService:
         self._on_card_completed_callback: Optional[
             Callable[[str, str], Coroutine[Any, Any, None]]
         ] = None
+        self._on_card_updated_callback: Optional[
+            Callable[[str, str, Optional[str], Optional[str]], Coroutine[Any, Any, None]]
+        ] = None
 
         self._webhook_server: Optional[TrelloWebhookServer] = None
         self._scheduler: Optional[AsyncIOScheduler] = None
@@ -247,6 +250,27 @@ class TrelloSyncService:
         )
         return res is not None
 
+    async def sync_task_completed(self, trello_card_id: str) -> bool:
+        """
+        Перемещает карточку в колонку Done (завершенные) в Trello.
+        """
+        if not self.is_enabled or not trello_card_id:
+            return False
+
+        if not self.done_list_ids:
+            await self.resolve_board_lists()
+
+        if not self.done_list_ids:
+            logger.warning("Не найдены колонки Done для перемещения карточки %s", trello_card_id)
+            return False
+
+        done_list_id = next(iter(self.done_list_ids))
+        res = await self.client.update_card(
+            card_id=trello_card_id,
+            list_id=done_list_id,
+        )
+        return res is not None
+
     def is_done_list(self, list_id: Optional[str], list_name: Optional[str] = None) -> bool:
         """
         Проверяет, является ли колонка колонкой завершенных задач
@@ -308,6 +332,16 @@ class TrelloSyncService:
 
         if is_completed and self._on_card_completed_callback:
             await self._on_card_completed_callback(card_id, card_name)
+        elif not is_completed and self._on_card_updated_callback and card_id and card_name:
+            # Обработка обновления карточки (переименование, изменение описания или дедлайна)
+            old_data = data.get("old", {})
+            if "name" in old_data or "desc" in old_data or "due" in old_data or card_name:
+                await self._on_card_updated_callback(
+                    card_id,
+                    card_name,
+                    card_info.get("desc"),
+                    card_info.get("due"),
+                )
 
     async def poll_done_columns(self) -> None:
         """
@@ -337,6 +371,43 @@ class TrelloSyncService:
                 card_name = card.get("name", "")
                 if card_id and self._on_card_completed_callback:
                     await self._on_card_completed_callback(card_id, card_name)
+
+    async def poll_active_cards(self) -> None:
+        """
+        Опрашивает все открытые карточки на доске и синхронизирует изменения
+        (название, описание, дедлайн) для активных задач из любых колонок доски.
+        """
+        if not self.is_enabled or not self._on_card_updated_callback:
+            return
+
+        if not hasattr(self.client, "get_cards_on_board"):
+            return
+
+        cards = await self.client.get_cards_on_board(self.board_id)
+        for card in cards:
+            card_id = card.get("id")
+            card_name = card.get("name", "")
+            list_id = card.get("idList")
+
+            # Карточки в Done обрабатываются через poll_done_columns
+            if self.is_done_list(list_id):
+                continue
+
+            if card_id and card_name:
+                await self._on_card_updated_callback(
+                    card_id,
+                    card_name,
+                    card.get("desc"),
+                    card.get("due"),
+                )
+
+    async def poll_all_and_sync(self) -> None:
+        """
+        Комплексный опрос доски: синхронизация завершенных задач и обновление
+        активных карточек из любых колонок.
+        """
+        await self.poll_done_columns()
+        await self.poll_active_cards()
 
     async def _setup_trello_webhook_if_configured(self) -> None:
         """
@@ -388,13 +459,16 @@ class TrelloSyncService:
         self,
         scheduler: AsyncIOScheduler,
         on_card_completed: Callable[[str, str], Coroutine[Any, Any, None]],
+        on_card_updated: Optional[
+            Callable[[str, str, Optional[str], Optional[str]], Coroutine[Any, Any, None]]
+        ] = None,
     ) -> bool:
         """
         Запускает сервис интеграции с Trello:
         1. Разрешает колонки на доске.
         2. Запускает встроенный вебхук-сервер (если включен).
         3. Настраивает вебхук в Trello (если задан callback URL).
-        4. Регистрирует периодическую задачу опроса Done колонок в APScheduler.
+        4. Регистрирует периодическую задачу опроса доски в APScheduler.
         """
         if not self.is_enabled:
             logger.info("Интеграция с Trello отключена или не заданы обязательные параметры в .env.")
@@ -402,6 +476,7 @@ class TrelloSyncService:
 
         logger.info("Запуск сервиса синхронизации Trello...")
         self._on_card_completed_callback = on_card_completed
+        self._on_card_updated_callback = on_card_updated
         self._scheduler = scheduler
 
         # 1. Разрешаем колонки доски
@@ -426,7 +501,7 @@ class TrelloSyncService:
         # 4. Регистрация систематического сканирования (fallback polling) в APScheduler
         poll_job_id = "trello_poll_done_columns"
         self._scheduler.add_job(
-            self.poll_done_columns,
+            self.poll_all_and_sync,
             trigger="interval",
             seconds=self.poll_interval,
             id=poll_job_id,

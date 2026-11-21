@@ -87,6 +87,25 @@ class TrelloClient:
             logger.error("Сетевая ошибка при запросе карточек списка %s: %s", list_id, e)
             return []
 
+    async def get_cards_on_board(self, board_id: str) -> List[Dict[str, Any]]:
+        """
+        Возвращает все открытые карточки на указанной доске Trello.
+        """
+        url = f"{self.base_url}/boards/{board_id}/cards"
+        params = self._auth_params({"filter": "open"})
+        session = await self._get_session()
+        try:
+            async with session.get(url, params=params) as resp:
+                if resp.status != 200:
+                    text = await resp.text()
+                    logger.error("Ошибка при получении карточек доски %s: HTTP %d: %s", board_id, resp.status, text)
+                    return []
+                data = await resp.json()
+                return data if isinstance(data, list) else []
+        except Exception as e:
+            logger.error("Сетевая ошибка при получении карточек доски Trello %s: %s", board_id, e)
+            return []
+
     async def get_card(self, card_id: str) -> Optional[Dict[str, Any]]:
         """
         Получает информацию о конкретной карточке по её ID.
