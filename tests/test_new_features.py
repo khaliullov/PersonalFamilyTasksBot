@@ -12,6 +12,7 @@ from unittest.mock import AsyncMock, MagicMock, PropertyMock, patch
 import zoneinfo
 
 import pytest
+from aiogram import types
 
 import bot as bot_module
 from calendar_sync.service import CalendarSyncService
@@ -80,7 +81,7 @@ def test_parse_deadline_iso_with_z_converts_to_bot_timezone():
 
 def test_get_task_inline_keyboard():
     """Проверяет корректность разметки inline клавиатуры для задачи (кнопки Завершить и В календарь)."""
-    # По умолчанию: есть обе кнопки: [✅ Завершить] и [📅 В календарь]
+    # По умолчанию (с дедлайном): есть обе кнопки: [✅ Завершить] и [📅 В календарь]
     kb = bot_module.get_task_inline_keyboard(42)
     assert kb is not None
     assert len(kb.inline_keyboard) == 1
@@ -91,6 +92,11 @@ def test_get_task_inline_keyboard():
     assert "Завершить" in b1.text
     assert b2.callback_data == "to_calendar:42"
     assert "В календарь" in b2.text
+
+    # Без явного дедлайна (has_deadline=False): кнопка "В календарь" НЕ добавляется!
+    kb_no_dl = bot_module.get_task_inline_keyboard(42, has_deadline=False)
+    assert len(kb_no_dl.inline_keyboard[0]) == 1
+    assert kb_no_dl.inline_keyboard[0][0].callback_data == "done:42"
 
     # Если уже в календаре
     kb_cal = bot_module.get_task_inline_keyboard(42, show_calendar_button=False, is_in_calendar=True)
@@ -173,9 +179,11 @@ async def test_callback_done_task_already_completed(initialized_db):
 
 @pytest.mark.asyncio
 async def test_cmd_tasks_includes_inline_buttons(initialized_db):
-    """Проверяет, что команда /tasks возвращает сообщение с inline клавиатурой."""
-    t1 = await bot_module.create_task(title="Задача 1", db_path=initialized_db)
-    t2 = await bot_module.create_task(title="Задача 2", db_path=initialized_db)
+    """Проверяет, что команда /tasks возвращает кнопки: с календарем для задач с дедлайном, без календаря для задач без дедлайна."""
+    # Задача 1 без дедлайна
+    t1 = await bot_module.create_task(title="Задача без дедлайна", db_path=initialized_db)
+    # Задача 2 с явным дедлайном
+    t2 = await bot_module.create_task(title="Задача с дедлайном", deadline="2026-11-25 15:00:00", db_path=initialized_db)
 
     fake_message = AsyncMock()
     fake_message.answer = AsyncMock()
@@ -187,10 +195,14 @@ async def test_cmd_tasks_includes_inline_buttons(initialized_db):
     reply_markup = fake_message.answer.call_args.kwargs.get("reply_markup")
     assert reply_markup is not None
     assert len(reply_markup.inline_keyboard) == 2
+
+    # Задача 2 (новая, первая в списке) имеет дедлайн -> 2 кнопки (Завершить + В календарь)
     assert reply_markup.inline_keyboard[0][0].callback_data == f"done:{t2}"
     assert reply_markup.inline_keyboard[0][1].callback_data == f"to_calendar:{t2}"
+
+    # Задача 1 (без дедлайна) -> ТОЛЬКО 1 кнопка (Завершить), без кнопки "В календарь"
+    assert len(reply_markup.inline_keyboard[1]) == 1
     assert reply_markup.inline_keyboard[1][0].callback_data == f"done:{t1}"
-    assert reply_markup.inline_keyboard[1][1].callback_data == f"to_calendar:{t1}"
 
 
 # ==============================================================================
@@ -633,3 +645,323 @@ async def test_callback_noop_cal():
     await bot_module.callback_noop_cal(callback)
     callback.answer.assert_called_once()
     assert "уже занесено" in callback.answer.call_args.args[0]
+
+
+# ==============================================================================
+# 7. ТЕСТЫ ПАГИНАЦИИ /tasks И ТОЧЕЧНОГО ОБНОВЛЕНИЯ КНОПОК
+# ==============================================================================
+
+
+def test_render_tasks_page_empty():
+    """Проверяет рендеринг при отсутствии активных задач."""
+    text, kb = bot_module.render_tasks_page([])
+    assert "Активных задач нет" in text
+    assert kb is None
+
+
+def test_render_tasks_page_pagination_and_size_limit():
+    """Проверяет корректное разделение на страницы и ограничение размера сообщения."""
+    fake_tasks = [
+        {
+            "id": i,
+            "title": f"Задача номер {i} с длинным названием",
+            "status": "pending",
+            "deadline": "2026-11-25 10:00:00",
+            "category": "task",
+            "description": "Очень длинное описание с множеством деталей и ссылок " * 20,
+            "location": "Офис на Тверской",
+            "contact_info": "+7 999 111-22-33",
+            "meeting_url": "https://meet.google.com/abc-def-ghi",
+            "trello_card_url": f"https://trello.com/c/card_{i}",
+            "caldav_uid": None,
+        }
+        for i in range(1, 26)
+    ]
+
+    # Страница 1 (из 3)
+    text_p1, kb_p1 = bot_module.render_tasks_page(fake_tasks, page=0, page_size=10)
+    assert "Стр. 1/3" in text_p1
+    assert "всего: 25" in text_p1
+    assert len(text_p1) < 4000  # Защита от лимита 4096 символов Telegram
+    # 10 строк задач + 1 строка навигации
+    assert len(kb_p1.inline_keyboard) == 11
+    nav_row_p1 = kb_p1.inline_keyboard[-1]
+    assert any("Вперед" in btn.text for btn in nav_row_p1)
+    assert not any("Назад" in btn.text for btn in nav_row_p1)
+
+    # Страница 2 (из 3)
+    text_p2, kb_p2 = bot_module.render_tasks_page(fake_tasks, page=1, page_size=10)
+    assert "Стр. 2/3" in text_p2
+    assert len(kb_p2.inline_keyboard) == 11
+    nav_row_p2 = kb_p2.inline_keyboard[-1]
+    assert any("Назад" in btn.text for btn in nav_row_p2)
+    assert any("Вперед" in btn.text for btn in nav_row_p2)
+
+    # Страница 3 (из 3, последние 5 задач)
+    text_p3, kb_p3 = bot_module.render_tasks_page(fake_tasks, page=2, page_size=10)
+    assert "Стр. 3/3" in text_p3
+    # 5 строк задач + 1 строка навигации
+    assert len(kb_p3.inline_keyboard) == 6
+    nav_row_p3 = kb_p3.inline_keyboard[-1]
+    assert any("Назад" in btn.text for btn in nav_row_p3)
+    assert not any("Вперед" in btn.text for btn in nav_row_p3)
+
+
+@pytest.mark.asyncio
+async def test_callback_tasks_page_updates_message(initialized_db):
+    """Проверяет листание страниц через callback tasks_page."""
+    for i in range(15):
+        await bot_module.create_task(title=f"Тестовая задача {i}", db_path=initialized_db)
+
+    callback = AsyncMock()
+    callback.data = "tasks_page:1"
+    callback.message = AsyncMock()
+    callback.answer = AsyncMock()
+
+    await bot_module.callback_tasks_page(callback, db_path=initialized_db)
+
+    callback.message.edit_text.assert_called_once()
+    edited_text = callback.message.edit_text.call_args.args[0]
+    assert "Стр. 2/2" in edited_text
+    callback.answer.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_callback_done_task_in_multi_row_list_preserves_other_buttons(initialized_db):
+    """
+    Проверяет, что при закрытии задачи из списка /tasks обновляется ТОЛЬКО строка
+    закрытой задачи, а остальные задачи и кнопки навигации остаются активными!
+    """
+    t1 = await bot_module.create_task(title="Задача 1", db_path=initialized_db)
+    t2 = await bot_module.create_task(title="Задача 2", db_path=initialized_db)
+
+    fake_markup = types.InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                types.InlineKeyboardButton(text=f"✅ #{t1} Задача 1", callback_data=f"done:{t1}"),
+                types.InlineKeyboardButton(text="📅 В календарь", callback_data=f"to_calendar:{t1}"),
+            ],
+            [
+                types.InlineKeyboardButton(text=f"✅ #{t2} Задача 2", callback_data=f"done:{t2}"),
+                types.InlineKeyboardButton(text="📅 В календарь", callback_data=f"to_calendar:{t2}"),
+            ],
+        ]
+    )
+
+    callback = AsyncMock()
+    callback.data = f"done:{t1}"
+    callback.message = AsyncMock()
+    callback.message.reply_markup = fake_markup
+    callback.answer = AsyncMock()
+
+    with patch.object(bot_module, "DB_PATH", initialized_db):
+        await bot_module.callback_done_task(callback)
+
+    callback.message.edit_reply_markup.assert_called_once()
+    new_markup = callback.message.edit_reply_markup.call_args.kwargs.get("reply_markup")
+    assert len(new_markup.inline_keyboard) == 2
+
+    # Строка 1: обновлена на статус Завершена
+    row1 = new_markup.inline_keyboard[0]
+    assert len(row1) == 1
+    assert f"#{t1} Завершена" in row1[0].text
+    assert row1[0].callback_data == "noop"
+
+    # Строка 2: осталась неизменной и активной!
+    row2 = new_markup.inline_keyboard[1]
+    assert len(row2) == 2
+    assert row2[0].callback_data == f"done:{t2}"
+    assert row2[1].callback_data == f"to_calendar:{t2}"
+
+
+@pytest.mark.asyncio
+async def test_callback_to_calendar_in_multi_row_list_preserves_other_buttons(initialized_db):
+    """
+    Проверяет, что при переносе в календарь из списка /tasks обновляется ТОЛЬКО строка
+    перенесенной задачи на [🗓 В календаре], а остальные кнопки остаются активными!
+    """
+    t1 = await bot_module.create_task(title="Встреча 1 в 14:00", deadline="2026-11-21 14:00:00", db_path=initialized_db)
+    t2 = await bot_module.create_task(title="Задача 2", db_path=initialized_db)
+
+    fake_markup = types.InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                types.InlineKeyboardButton(text=f"✅ #{t1} Встреча 1", callback_data=f"done:{t1}"),
+                types.InlineKeyboardButton(text="📅 В календарь", callback_data=f"to_calendar:{t1}"),
+            ],
+            [
+                types.InlineKeyboardButton(text=f"✅ #{t2} Задача 2", callback_data=f"done:{t2}"),
+                types.InlineKeyboardButton(text="📅 В календарь", callback_data=f"to_calendar:{t2}"),
+            ],
+        ]
+    )
+
+    mock_cal_service = AsyncMock(spec=CalendarSyncService)
+    mock_cal_service.is_enabled = True
+    mock_cal_service.create_event.return_value = {"uid": "cal_111", "url": "https://..."}
+
+    callback = AsyncMock()
+    callback.data = f"to_calendar:{t1}"
+    callback.message = AsyncMock()
+    callback.message.reply_markup = fake_markup
+    callback.answer = AsyncMock()
+
+    with patch.object(bot_module, "DB_PATH", initialized_db), \
+         patch.object(bot_module, "calendar_service", mock_cal_service):
+        await bot_module.callback_to_calendar(callback)
+
+    callback.message.edit_reply_markup.assert_called_once()
+    new_markup = callback.message.edit_reply_markup.call_args.kwargs.get("reply_markup")
+    assert len(new_markup.inline_keyboard) == 2
+
+    # Строка 1: кнопка календаря стала [🗓 В календаре]
+    row1 = new_markup.inline_keyboard[0]
+    assert len(row1) == 2
+    assert row1[0].callback_data == f"done:{t1}"
+    assert row1[1].callback_data == "noop_cal"
+    assert "В календаре" in row1[1].text
+
+    # Строка 2: осталась неизменной!
+    row2 = new_markup.inline_keyboard[1]
+    assert len(row2) == 2
+    assert row2[0].callback_data == f"done:{t2}"
+    assert row2[1].callback_data == f"to_calendar:{t2}"
+
+
+# ==============================================================================
+# 8. ТЕСТЫ ПРОВЕРКИ CalDAV ПРИ ЗАПУСКЕ (FALL FAST И УСПЕШНОЕ ПОДКЛЮЧЕНИЕ)
+# ==============================================================================
+
+
+@pytest.mark.asyncio
+async def test_caldav_check_connection_success():
+    """Проверяет успешное прохождение проверки связи с CalDAV и выбор календаря."""
+    mock_cal = MagicMock()
+    mock_cal.name = "Personal"
+
+    mock_principal = MagicMock()
+    mock_principal.calendars.return_value = [mock_cal]
+
+    mock_client = MagicMock()
+    mock_client.principal.return_value = mock_principal
+
+    service = CalendarSyncService(
+        url="https://caldav.icloud.com/",
+        username="user@icloud.com",
+        password="app-specific-password",
+        calendar_name="Personal",
+        enabled=True,
+    )
+
+    with patch("caldav.DAVClient", return_value=mock_client):
+        active_cal = await service.check_connection()
+
+    assert active_cal == "Personal"
+    assert service.active_calendar_name == "Personal"
+
+
+@pytest.mark.asyncio
+async def test_caldav_check_connection_disabled():
+    """Проверяет, что при enabled=False проверка не выполняется."""
+    service = CalendarSyncService(enabled=False)
+    res = await service.check_connection()
+    assert res == ""
+
+
+@pytest.mark.asyncio
+async def test_caldav_check_connection_missing_credentials_raises():
+    """Проверяет, что при включенном CalDAV без учетных данных выбрасывается ошибка."""
+    service = CalendarSyncService(
+        url="",
+        username="",
+        password="",
+        enabled=True,
+    )
+    with pytest.raises(RuntimeError) as exc_info:
+        await service.check_connection()
+    assert "не заданы обязательные параметры" in str(exc_info.value)
+
+
+@pytest.mark.asyncio
+async def test_caldav_check_connection_network_or_auth_error_raises():
+    """Проверяет, что при ошибке сети/авторизации выбрасывается RuntimeError."""
+    service = CalendarSyncService(
+        url="https://caldav.icloud.com/",
+        username="user@icloud.com",
+        password="bad-password",
+        enabled=True,
+    )
+    with patch("caldav.DAVClient", side_effect=Exception("401 Unauthorized")):
+        with pytest.raises(RuntimeError) as exc_info:
+            await service.check_connection()
+    assert "Не удалось подключиться к CalDAV серверу" in str(exc_info.value)
+
+
+@pytest.mark.asyncio
+async def test_caldav_check_connection_calendar_not_found_raises():
+    """Проверяет, что если указанного в конфиге календаря нет на сервере — бот падает с ошибкой."""
+    mock_cal = MagicMock()
+    mock_cal.name = "Work"
+
+    mock_principal = MagicMock()
+    mock_principal.calendars.return_value = [mock_cal]
+
+    mock_client = MagicMock()
+    mock_client.principal.return_value = mock_principal
+
+    service = CalendarSyncService(
+        url="https://caldav.icloud.com/",
+        username="user@icloud.com",
+        password="password",
+        calendar_name="Personal",
+        enabled=True,
+    )
+
+    with patch("caldav.DAVClient", return_value=mock_client):
+        with pytest.raises(RuntimeError) as exc_info:
+            await service.check_connection()
+    assert "не найден на сервере CalDAV" in str(exc_info.value)
+
+
+@pytest.mark.asyncio
+async def test_on_startup_fails_fast_when_caldav_broken(initialized_db):
+    """
+    Проверяет, что при старте бота, если CalDAV включен в конфиге, но связи нет —
+    on_startup аварийно падает (fail-fast), предотвращая работу с битым календарем.
+    """
+    mock_bot = AsyncMock()
+    mock_cal_service = AsyncMock(spec=CalendarSyncService)
+    mock_cal_service.enabled = True
+    mock_cal_service.check_connection.side_effect = RuntimeError("CalDAV server unreachable")
+    mock_scheduler = MagicMock()
+    mock_scheduler.running = True
+
+    with patch.object(bot_module, "DB_PATH", initialized_db), \
+         patch.object(bot_module, "scheduler", mock_scheduler), \
+         patch.object(bot_module, "calendar_service", mock_cal_service), \
+         patch.object(bot_module, "trello_service", None):
+
+        with pytest.raises(RuntimeError) as exc_info:
+            await bot_module.on_startup(mock_bot)
+
+        assert "CalDAV server unreachable" in str(exc_info.value)
+        mock_cal_service.check_connection.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_on_startup_succeeds_when_caldav_ok(initialized_db):
+    """Проверяет, что при успешной проверке CalDAV бот стартует штатно."""
+    mock_bot = AsyncMock()
+    mock_cal_service = AsyncMock(spec=CalendarSyncService)
+    mock_cal_service.enabled = True
+    mock_cal_service.check_connection.return_value = "Family"
+    mock_scheduler = MagicMock()
+    mock_scheduler.running = True
+
+    with patch.object(bot_module, "DB_PATH", initialized_db), \
+         patch.object(bot_module, "scheduler", mock_scheduler), \
+         patch.object(bot_module, "calendar_service", mock_cal_service), \
+         patch.object(bot_module, "trello_service", None):
+
+        await bot_module.on_startup(mock_bot)
+        mock_cal_service.check_connection.assert_called_once()

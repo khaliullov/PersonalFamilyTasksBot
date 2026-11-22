@@ -39,11 +39,99 @@ class CalendarSyncService:
         self.password = password.strip()
         self.calendar_name = calendar_name.strip()
         self.enabled = enabled
+        self.active_calendar_name: Optional[str] = None
 
     @property
     def is_enabled(self) -> bool:
         """Интеграция активна только если включена и заданы учетные данные CalDAV."""
         return bool(self.enabled and self.url and self.username and self.password)
+
+    def _sync_check_connection(self) -> str:
+        """
+        Синхронно проверяет доступность CalDAV сервера, корректность учетных данных
+        и наличие целевого календаря.
+        Если доступ есть — возвращает название активного календаря.
+        Если доступа нет — выбрасывает RuntimeError с подробным описанием причины.
+        """
+        if not self.enabled:
+            return ""
+
+        if not self.url or not self.username or not self.password:
+            missing = []
+            if not self.url:
+                missing.append("CALDAV_URL")
+            if not self.username:
+                missing.append("CALDAV_USERNAME")
+            if not self.password:
+                missing.append("CALDAV_PASSWORD")
+            err_msg = (
+                f"CalDAV включен в конфигурации (CALDAV_ENABLED=true), но не заданы "
+                f"обязательные параметры: {', '.join(missing)}!"
+            )
+            logger.critical("❌ %s", err_msg)
+            raise RuntimeError(err_msg)
+
+        try:
+            client = caldav.DAVClient(
+                url=self.url,
+                username=self.username,
+                password=self.password,
+            )
+            principal = client.principal()
+            calendars = principal.calendars()
+        except Exception as e:
+            err_msg = (
+                f"Не удалось подключиться к CalDAV серверу '{self.url}' "
+                f"под пользователем '{self.username}': {e}"
+            )
+            logger.critical("❌ %s", err_msg)
+            raise RuntimeError(err_msg) from e
+
+        if not calendars:
+            err_msg = (
+                f"Подключение к CalDAV '{self.url}' успешно, но для учетной записи "
+                f"'{self.username}' не найдено ни одного доступного календаря!"
+            )
+            logger.critical("❌ %s", err_msg)
+            raise RuntimeError(err_msg)
+
+        target_cal = None
+        cal_names = []
+        for c in calendars:
+            c_name = getattr(c, "name", "") or ""
+            cal_names.append(c_name)
+            if self.calendar_name and c_name.strip().lower() == self.calendar_name.lower():
+                target_cal = c
+                break
+
+        if self.calendar_name:
+            if not target_cal:
+                err_msg = (
+                    f"Указанный календарь '{self.calendar_name}' не найден на сервере CalDAV. "
+                    f"Доступные календари: {cal_names}"
+                )
+                logger.critical("❌ %s", err_msg)
+                raise RuntimeError(err_msg)
+            selected_name = getattr(target_cal, "name", "") or self.calendar_name
+        else:
+            target_cal = calendars[0]
+            selected_name = getattr(target_cal, "name", "") or "Default"
+
+        self.active_calendar_name = selected_name
+        logger.info(
+            "✅ Связь с Apple Calendar (CalDAV) успешно установлена (сервер: %s, пользователь: %s, календарь: '%s').",
+            self.url,
+            self.username,
+            selected_name,
+        )
+        return selected_name
+
+    async def check_connection(self) -> str:
+        """
+        Асинхронно проверяет доступность CalDAV сервера в отдельном потоке.
+        Выбрасывает RuntimeError при ошибке доступа.
+        """
+        return await asyncio.to_thread(self._sync_check_connection)
 
     def _build_ical_event(
         self,

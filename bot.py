@@ -5,7 +5,7 @@ import json
 import logging
 import os
 import re
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 try:
     from dotenv import load_dotenv
@@ -939,10 +939,11 @@ def get_task_inline_keyboard(
     task_id: int,
     show_calendar_button: bool = True,
     is_in_calendar: bool = False,
+    has_deadline: bool = True,
 ) -> types.InlineKeyboardMarkup:
     """
     Формирует inline клавиатуру с кнопкой быстрого завершения задачи
-    и кнопкой добавления в календарь.
+    и (при наличии явного дедлайна) кнопкой добавления в календарь.
     """
     buttons = [
         types.InlineKeyboardButton(
@@ -950,18 +951,18 @@ def get_task_inline_keyboard(
             callback_data=f"done:{task_id}",
         )
     ]
-    if show_calendar_button:
-        buttons.append(
-            types.InlineKeyboardButton(
-                text="📅 В календарь",
-                callback_data=f"to_calendar:{task_id}",
-            )
-        )
-    elif is_in_calendar:
+    if is_in_calendar:
         buttons.append(
             types.InlineKeyboardButton(
                 text="🗓 В календаре",
                 callback_data="noop_cal",
+            )
+        )
+    elif show_calendar_button and has_deadline:
+        buttons.append(
+            types.InlineKeyboardButton(
+                text="📅 В календарь",
+                callback_data=f"to_calendar:{task_id}",
             )
         )
     return types.InlineKeyboardMarkup(inline_keyboard=[buttons])
@@ -1017,6 +1018,7 @@ async def send_task_reminder(
     )
 
     in_cal = bool(task.get("caldav_uid")) if task else False
+    has_dl = bool(actual_deadline)
     try:
         await bot.send_message(
             chat_id=my_id,
@@ -1025,6 +1027,7 @@ async def send_task_reminder(
                 task_id,
                 show_calendar_button=not in_cal,
                 is_in_calendar=in_cal,
+                has_deadline=has_dl,
             ),
         )
         await update_task_status(task_id, "reminded", target_path)
@@ -1291,6 +1294,7 @@ async def process_recent_context_with_ollama(bot: Bot, user_id: int) -> None:
             )
 
         in_cal = bool(caldav_info)
+        has_dl = bool(has_deadline and deadline_str)
         try:
             await bot.send_message(
                 chat_id=MY_ID,
@@ -1299,6 +1303,7 @@ async def process_recent_context_with_ollama(bot: Bot, user_id: int) -> None:
                     task_id,
                     show_calendar_button=not in_cal,
                     is_in_calendar=in_cal,
+                    has_deadline=has_dl,
                 ),
             )
         except Exception as e:
@@ -1387,6 +1392,7 @@ async def process_recent_context_with_ollama(bot: Bot, user_id: int) -> None:
         )
 
         in_cal = bool(existing_task.get("caldav_uid"))
+        has_dl = bool(final_deadline)
         try:
             await bot.send_message(
                 chat_id=MY_ID,
@@ -1395,6 +1401,7 @@ async def process_recent_context_with_ollama(bot: Bot, user_id: int) -> None:
                     target_task_id,
                     show_calendar_button=not in_cal,
                     is_in_calendar=in_cal,
+                    has_deadline=has_dl,
                 ),
             )
         except Exception as e:
@@ -1696,7 +1703,8 @@ async def cmd_start(message: types.Message) -> None:
     """Информационное сообщение при старте бота."""
     asr_status = f"<b>включен</b> (<code>{ASR_MODEL_SIZE}</code>, <code>{ASR_DEVICE}</code>)" if ASR_ENABLED else "<b>выключен</b>"
     trello_status = "<b>включена</b>" if (trello_service and trello_service.is_enabled) else "<b>выключена</b>"
-    caldav_status = "<b>включен</b>" if (calendar_service and calendar_service.is_enabled) else "<b>выключен</b>"
+    cal_name_str = f" (<code>{calendar_service.active_calendar_name}</code>)" if (calendar_service and getattr(calendar_service, "active_calendar_name", None)) else ""
+    caldav_status = f"<b>включен</b>{cal_name_str}" if (calendar_service and calendar_service.is_enabled) else "<b>выключен</b>"
     await message.answer(
         "👋 <b>Бот контекстного учета задач активен.</b>\n\n"
         "• Мониторинг Telegram Business: <b>включен</b>\n"
@@ -1715,21 +1723,37 @@ async def cmd_start(message: types.Message) -> None:
     )
 
 
-@router.message(Command("tasks"), F.from_user.id == MY_ID)
-async def cmd_tasks(message: types.Message) -> None:
-    """Выводит список актуальных задач из базы данных с удобными кнопками завершения."""
-    tasks = await get_active_tasks()
-    if not tasks:
-        await message.answer("🎉 <b>Активных задач нет!</b> Все сделано.")
-        return
+TASKS_PAGE_SIZE: int = 10
 
-    lines = ["📋 <b>Текущие задачи:</b>\n"]
-    keyboard_buttons = []
 
-    for t in tasks:
+def render_tasks_page(
+    tasks: List[Dict[str, Any]],
+    page: int = 0,
+    page_size: int = TASKS_PAGE_SIZE,
+) -> Tuple[str, Optional[types.InlineKeyboardMarkup]]:
+    """
+    Формирует текст сообщения и клавиатуру для указанной страницы списка задач.
+    Гарантирует, что размер сообщения не превысит лимит Telegram (4096 символов).
+    """
+    total_tasks = len(tasks)
+    if total_tasks == 0:
+        return "🎉 <b>Активных задач нет!</b> Все сделано.", None
+
+    total_pages = max(1, (total_tasks + page_size - 1) // page_size)
+    current_page = max(0, min(page, total_pages - 1))
+
+    start_idx = current_page * page_size
+    end_idx = min(start_idx + page_size, total_tasks)
+    page_tasks = tasks[start_idx:end_idx]
+
+    header = f"📋 <b>Текущие задачи (Стр. {current_page + 1}/{total_pages}, всего: {total_tasks}):</b>\n"
+    lines = [header]
+    keyboard_buttons: List[List[types.InlineKeyboardButton]] = []
+
+    for t in page_tasks:
         category = t.get("category", "task")
         status_icon = "🗓" if category == "calendar" else ("⏳" if t["status"] == "pending" else "⏰")
-        dl = f" (до <code>{t['deadline']}</code>)" if t["deadline"] else " (без дедлайна)"
+        dl = f" (до <code>{t['deadline']}</code>)" if t.get("deadline") else " (без дедлайна)"
         item_text = f"{status_icon} <b>#{t['id']}</b>: {html.escape(t['title'])}{dl} [<code>{t['status']}</code>]"
         if t.get("location"):
             item_text += f"\n   📍 <i>{html.escape(t['location'])}</i>"
@@ -1741,37 +1765,86 @@ async def cmd_tasks(message: types.Message) -> None:
             item_text += f"\n   📋 <a href=\"{t['trello_card_url']}\">Карточка в Trello</a>"
         if t.get("description"):
             desc_preview = html.escape(t["description"])
-            if len(desc_preview) > 200:
-                desc_preview = desc_preview[:200] + "..."
+            if len(desc_preview) > 100:
+                desc_preview = desc_preview[:100] + "..."
             item_text += f"\n   🔗 <i>{desc_preview}</i>"
         lines.append(item_text)
 
-        btn_title = t["title"][:25] + ("..." if len(t["title"]) > 25 else "")
+        btn_title = t["title"][:20] + ("..." if len(t["title"]) > 20 else "")
         row = [
             types.InlineKeyboardButton(
                 text=f"✅ #{t['id']} {btn_title}",
                 callback_data=f"done:{t['id']}",
             )
         ]
-        if not t.get("caldav_uid"):
-            row.append(
-                types.InlineKeyboardButton(
-                    text="📅 В календарь",
-                    callback_data=f"to_calendar:{t['id']}",
-                )
-            )
-        else:
+        if t.get("caldav_uid"):
             row.append(
                 types.InlineKeyboardButton(
                     text="🗓 В календаре",
                     callback_data="noop_cal",
                 )
             )
+        elif t.get("deadline"):
+            row.append(
+                types.InlineKeyboardButton(
+                    text="📅 В календарь",
+                    callback_data=f"to_calendar:{t['id']}",
+                )
+            )
         keyboard_buttons.append(row)
 
+    # Навигационные кнопки пагинации (если страниц больше одной)
+    if total_pages > 1:
+        nav_row = []
+        if current_page > 0:
+            nav_row.append(
+                types.InlineKeyboardButton(
+                    text="⬅️ Назад",
+                    callback_data=f"tasks_page:{current_page - 1}",
+                )
+            )
+        nav_row.append(
+            types.InlineKeyboardButton(
+                text=f"📄 {current_page + 1}/{total_pages}",
+                callback_data="noop_page",
+            )
+        )
+        if current_page < total_pages - 1:
+            nav_row.append(
+                types.InlineKeyboardButton(
+                    text="Вперед ➡️",
+                    callback_data=f"tasks_page:{current_page + 1}",
+                )
+            )
+        keyboard_buttons.append(nav_row)
+
     lines.append("\n<i>Нажмите на inline-кнопку под сообщением или отправьте: /done &lt;id&gt;</i>")
+    message_text = "\n\n".join(lines)
+
+    # Защита от превышения лимита 4096 символов Telegram
+    if len(message_text) > 3900:
+        message_text = message_text[:3850] + "\n\n... <i>(текст сокращен под лимит Telegram)</i>"
+
     reply_markup = types.InlineKeyboardMarkup(inline_keyboard=keyboard_buttons) if keyboard_buttons else None
-    await message.answer("\n\n".join(lines), reply_markup=reply_markup)
+    return message_text, reply_markup
+
+
+@router.message(Command("tasks"), F.from_user.id == MY_ID)
+async def cmd_tasks(message: types.Message) -> None:
+    """
+    Выводит список актуальных задач из базы данных с пагинацией по 10 штук на страницу
+    и кнопками быстрого действия. Поддерживает вызов: /tasks или /tasks <номер_страницы>.
+    """
+    page = 0
+    raw_text = message.text
+    if isinstance(raw_text, str):
+        args = raw_text.split()
+        if len(args) > 1 and args[1].isdigit():
+            page = max(0, int(args[1]) - 1)
+
+    tasks = await get_active_tasks()
+    text, reply_markup = render_tasks_page(tasks, page=page)
+    await message.answer(text, reply_markup=reply_markup)
 
 
 @router.message(Command("done"), F.from_user.id == MY_ID)
@@ -1814,11 +1887,26 @@ async def callback_done_task(callback: types.CallbackQuery) -> None:
     if task.get("status") == "completed":
         await callback.answer(f"Задача #{task_id} уже выполнена!", show_alert=False)
         try:
-            if callback.message:
-                done_markup = types.InlineKeyboardMarkup(
-                    inline_keyboard=[[types.InlineKeyboardButton(text=f"✅ Задача #{task_id} завершена", callback_data="noop")]]
-                )
-                await callback.message.edit_reply_markup(reply_markup=done_markup)
+            if callback.message and callback.message.reply_markup:
+                old_rows = callback.message.reply_markup.inline_keyboard
+                if len(old_rows) <= 1:
+                    done_markup = types.InlineKeyboardMarkup(
+                        inline_keyboard=[[types.InlineKeyboardButton(text=f"✅ Задача #{task_id} завершена", callback_data="noop")]]
+                    )
+                    await callback.message.edit_reply_markup(reply_markup=done_markup)
+                else:
+                    new_rows = []
+                    for row in old_rows:
+                        new_row = []
+                        for btn in row:
+                            if btn.callback_data == f"done:{task_id}":
+                                new_row.append(types.InlineKeyboardButton(text=f"✅ #{task_id} Завершена", callback_data="noop"))
+                            elif btn.callback_data == f"to_calendar:{task_id}":
+                                continue
+                            else:
+                                new_row.append(btn)
+                        new_rows.append(new_row)
+                    await callback.message.edit_reply_markup(reply_markup=types.InlineKeyboardMarkup(inline_keyboard=new_rows))
         except Exception:
             pass
         return
@@ -1827,11 +1915,26 @@ async def callback_done_task(callback: types.CallbackQuery) -> None:
     await callback.answer(f"✅ Задача #{task_id} выполнена!", show_alert=False)
 
     try:
-        if callback.message:
-            done_markup = types.InlineKeyboardMarkup(
-                inline_keyboard=[[types.InlineKeyboardButton(text=f"✅ Задача #{task_id} завершена", callback_data="noop")]]
-            )
-            await callback.message.edit_reply_markup(reply_markup=done_markup)
+        if callback.message and callback.message.reply_markup:
+            old_rows = callback.message.reply_markup.inline_keyboard
+            if len(old_rows) <= 1:
+                done_markup = types.InlineKeyboardMarkup(
+                    inline_keyboard=[[types.InlineKeyboardButton(text=f"✅ Задача #{task_id} завершена", callback_data="noop")]]
+                )
+                await callback.message.edit_reply_markup(reply_markup=done_markup)
+            else:
+                new_rows = []
+                for row in old_rows:
+                    new_row = []
+                    for btn in row:
+                        if btn.callback_data == f"done:{task_id}":
+                            new_row.append(types.InlineKeyboardButton(text=f"✅ #{task_id} Завершена", callback_data="noop"))
+                        elif btn.callback_data == f"to_calendar:{task_id}":
+                            continue
+                        else:
+                            new_row.append(btn)
+                    new_rows.append(new_row)
+                await callback.message.edit_reply_markup(reply_markup=types.InlineKeyboardMarkup(inline_keyboard=new_rows))
     except Exception as e:
         logger.debug("Не удалось обновить разметку inline-кнопки после завершения: %s", e)
 
@@ -1872,9 +1975,22 @@ async def callback_to_calendar(
     if task.get("caldav_uid"):
         await callback.answer("Это событие уже занесено в Apple Calendar.", show_alert=False)
         try:
-            if callback.message:
-                cal_markup = get_task_inline_keyboard(task_id, show_calendar_button=False, is_in_calendar=True)
-                await callback.message.edit_reply_markup(reply_markup=cal_markup)
+            if callback.message and callback.message.reply_markup:
+                old_rows = callback.message.reply_markup.inline_keyboard
+                if len(old_rows) <= 1:
+                    cal_markup = get_task_inline_keyboard(task_id, show_calendar_button=False, is_in_calendar=True)
+                    await callback.message.edit_reply_markup(reply_markup=cal_markup)
+                else:
+                    new_rows = []
+                    for row in old_rows:
+                        new_row = []
+                        for btn in row:
+                            if btn.callback_data == f"to_calendar:{task_id}":
+                                new_row.append(types.InlineKeyboardButton(text="🗓 В календаре", callback_data="noop_cal"))
+                            else:
+                                new_row.append(btn)
+                        new_rows.append(new_row)
+                    await callback.message.edit_reply_markup(reply_markup=types.InlineKeyboardMarkup(inline_keyboard=new_rows))
         except Exception:
             pass
         return
@@ -1930,11 +2046,51 @@ async def callback_to_calendar(
         await callback.answer("🗓 Категория обновлена на 'Календарь'. CalDAV не настроен.", show_alert=True)
 
     try:
-        if callback.message:
-            cal_markup = get_task_inline_keyboard(task_id, show_calendar_button=False, is_in_calendar=True)
-            await callback.message.edit_reply_markup(reply_markup=cal_markup)
+        if callback.message and callback.message.reply_markup:
+            old_rows = callback.message.reply_markup.inline_keyboard
+            if len(old_rows) <= 1:
+                cal_markup = get_task_inline_keyboard(task_id, show_calendar_button=False, is_in_calendar=True)
+                await callback.message.edit_reply_markup(reply_markup=cal_markup)
+            else:
+                new_rows = []
+                for row in old_rows:
+                    new_row = []
+                    for btn in row:
+                        if btn.callback_data == f"to_calendar:{task_id}":
+                            new_row.append(types.InlineKeyboardButton(text="🗓 В календаре", callback_data="noop_cal"))
+                        else:
+                            new_row.append(btn)
+                    new_rows.append(new_row)
+                await callback.message.edit_reply_markup(reply_markup=types.InlineKeyboardMarkup(inline_keyboard=new_rows))
     except Exception as e:
         logger.debug("Не удалось обновить inline-кнопки после добавления в календарь: %s", e)
+
+
+@router.callback_query(F.data.startswith("tasks_page:"))
+async def callback_tasks_page(
+    callback: types.CallbackQuery,
+    db_path: Optional[str] = None,
+) -> None:
+    """Обработчик перелистывания страниц пагинации в /tasks."""
+    data = callback.data or ""
+    parts = data.split(":")
+    page = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else 0
+
+    target_path = _get_db_path(db_path)
+    tasks = await get_active_tasks(db_path=target_path)
+    text, reply_markup = render_tasks_page(tasks, page=page)
+    try:
+        if callback.message:
+            await callback.message.edit_text(text, reply_markup=reply_markup)
+    except Exception as e:
+        logger.debug("Не удалось обновить страницу /tasks: %s", e)
+    await callback.answer()
+
+
+@router.callback_query(F.data == "noop_page")
+async def callback_noop_page(callback: types.CallbackQuery) -> None:
+    """Заглушка для индикатора текущей страницы."""
+    await callback.answer()
 
 
 @router.callback_query(F.data == "noop_cal")
@@ -1955,8 +2111,9 @@ async def on_startup(bot: Bot) -> None:
     logger.info("Запуск бота...")
     await init_db(DB_PATH)
 
-    scheduler.start()
-    logger.info("Планировщик APScheduler запущен (часовой пояс: %s).", BOT_TIMEZONE)
+    if not scheduler.running:
+        scheduler.start()
+        logger.info("Планировщик APScheduler запущен (часовой пояс: %s).", BOT_TIMEZONE)
 
     await restore_scheduled_jobs(bot, scheduler, DB_PATH)
 
@@ -1967,6 +2124,12 @@ async def on_startup(bot: Bot) -> None:
             on_card_completed=handle_trello_card_completed,
             on_card_updated=handle_trello_card_updated,
         )
+
+    # Проверка подключения к Apple Calendar (CalDAV) при старте бота, если включен в конфиге
+    if calendar_service and calendar_service.enabled:
+        logger.info("Проверка доступности Apple Calendar (CalDAV)...")
+        cal_name = await calendar_service.check_connection()
+        logger.info("✅ Связь с календарем Apple (CalDAV) есть! Активный календарь: '%s'", cal_name)
 
     logger.info("Бот готов к обработке событий Telegram Business.")
 
