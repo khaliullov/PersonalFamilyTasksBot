@@ -6,7 +6,8 @@
 [![aiogram](https://img.shields.io/badge/aiogram-3.x-2CA5E0.svg?logo=telegram&logoColor=white)](https://docs.aiogram.dev/)
 [![faster-whisper](https://img.shields.io/badge/ASR-faster--whisper-red.svg)](https://github.com/SYSTRAN/faster-whisper)
 [![Ollama](https://img.shields.io/badge/Ollama-Qwen%203.8%20(27B)-black.svg?logo=ollama&logoColor=white)](https://ollama.com/)
-[![SQLite](https://img.shields.io/badge/Database-aiosqlite-003B57.svg?logo=sqlite&logoColor=white)](https://sqlite.org/)
+[![Database](https://img.shields.io/badge/Database-PostgreSQL%20%7C%20SQLite-336791.svg?logo=postgresql&logoColor=white)](https://www.postgresql.org/)
+[![Docker](https://img.shields.io/badge/Docker-Ready-2496ED.svg?logo=docker&logoColor=white)](https://www.docker.com/)
 [![APScheduler](https://img.shields.io/badge/Scheduler-APScheduler-orange.svg)](https://apscheduler.readthedocs.io/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
@@ -170,7 +171,40 @@ flowchart TD
 
 ---
 
-## 🚀 Установка и быстрый старт
+## 🚀 Быстрый старт через Docker (Рекомендуемый способ)
+
+Для быстрого развертывания бота и общей базы данных PostgreSQL предусмотрен `Makefile`:
+
+```bash
+# 1. Заполните .env на основе шаблона
+cp .env.example .env
+nano .env
+
+# 2. Выполните единую команду сборки, создания сети и запуска
+make deploy
+```
+
+`make deploy` автоматически:
+- Корректно завершает любые ранее запущенные локальные процессы бота.
+- Создает общую Docker-сеть `shared_network`.
+- Поднимает общий контейнер PostgreSQL `shared-postgres` (порт `5432`).
+- Автоматически создает БД `family_tasks_bot` (можно менять на любое имя для других контейнеров).
+- При первом запуске автоматически переносит существующие данные из `tasks.db` в PostgreSQL!
+- Собирает образ и запускает контейнер `family-tasks-bot`.
+
+### Полезные команды Makefile:
+- `make deploy` — обновить код, пересобрать образ и перезапустить контейнеры с нулевым простоем.
+- `make logs` — просмотр логов всех сервисов в реальном времени.
+- `make logs-bot` — просмотр логов только Telegram бота.
+- `make logs-db` — просмотр логов PostgreSQL.
+- `make status` — проверка состояния контейнеров.
+- `make restart` — быстрый перезапуск сервисов.
+- `make down` — остановка всех сервисов.
+- `make test` — запуск полного набора тестов pytest.
+
+---
+
+## 🛠 Локальная установка без Docker
 
 ### 1. Клонирование репозитория
 

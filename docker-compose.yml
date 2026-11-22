@@ -1,0 +1,61 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: shared-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
+      POSTGRES_DB: postgres
+      POSTGRES_MULTIPLE_DATABASES: ${POSTGRES_DB:-family_tasks_bot}
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - shared_postgres_data:/var/lib/postgresql/data
+      - ./docker/init-user-db.sh:/docker-entrypoint-initdb.d/init-user-db.sh:ro
+    networks:
+      - shared-network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-postgres}"]
+      interval: 3s
+      timeout: 3s
+      retries: 5
+
+  bot:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: family-tasks-bot
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      - POSTGRES_HOST=shared-postgres
+      - POSTGRES_PORT=5432
+      - POSTGRES_USER=${POSTGRES_USER:-postgres}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-postgres}
+      - POSTGRES_DB=${POSTGRES_DB:-family_tasks_bot}
+      - DB_TYPE=postgres
+      - ASR_DEVICE=cpu
+      - IN_DOCKER=1
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    ports:
+      - "${TRELLO_WEBHOOK_PORT:-8080}:8080"
+    volumes:
+      - ./voice_audio:/app/voice_audio
+      - ./tasks.db:/app/tasks.db:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - shared-network
+
+volumes:
+  shared_postgres_data:
+    name: shared_postgres_data
+
+networks:
+  shared-network:
+    name: shared_network
+    external: true

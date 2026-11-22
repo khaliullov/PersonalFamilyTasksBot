@@ -46,6 +46,43 @@ class CalendarSyncService:
         """Интеграция активна только если включена и заданы учетные данные CalDAV."""
         return bool(self.enabled and self.url and self.username and self.password)
 
+    def _get_dav_client(self) -> caldav.DAVClient:
+        """
+        Создает и настраивает экземпляр caldav.DAVClient.
+        Принудительно отключает HTTP/2 и HTTP/3 в niquests сессии,
+        так как сервера Apple iCloud CalDAV сбрасывают HTTP/2 потоки (Stream reset 0x101)
+        при выполнении WebDAV команд PROPFIND/REPORT.
+        """
+        client = caldav.DAVClient(
+            url=self.url,
+            username=self.username,
+            password=self.password,
+        )
+        try:
+            import niquests
+            client.session = niquests.Session(disable_http2=True, disable_http3=True)
+        except Exception as e:
+            logger.debug("Не удалось настроить niquests сессию с принудительным HTTP/1.1: %s", e)
+        return client
+
+    @staticmethod
+    def _get_calendar_name(cal: Any) -> str:
+        """Возвращает отображаемое имя календаря без устаревших предупреждений."""
+        if hasattr(cal, "get_display_name"):
+            try:
+                name = cal.get_display_name()
+                if isinstance(name, str) and name:
+                    return name
+            except Exception:
+                pass
+        raw = getattr(cal, "name", "")
+        if isinstance(raw, str) and raw:
+            return raw
+        disp = getattr(cal, "display_name", "")
+        if isinstance(disp, str) and disp:
+            return disp
+        return ""
+
     def _sync_check_connection(self) -> str:
         """
         Синхронно проверяет доступность CalDAV сервера, корректность учетных данных
@@ -72,11 +109,7 @@ class CalendarSyncService:
             raise RuntimeError(err_msg)
 
         try:
-            client = caldav.DAVClient(
-                url=self.url,
-                username=self.username,
-                password=self.password,
-            )
+            client = self._get_dav_client()
             principal = client.principal()
             calendars = principal.calendars()
         except Exception as e:
@@ -98,7 +131,7 @@ class CalendarSyncService:
         target_cal = None
         cal_names = []
         for c in calendars:
-            c_name = getattr(c, "name", "") or ""
+            c_name = self._get_calendar_name(c)
             cal_names.append(c_name)
             if self.calendar_name and c_name.strip().lower() == self.calendar_name.lower():
                 target_cal = c
@@ -112,10 +145,10 @@ class CalendarSyncService:
                 )
                 logger.critical("❌ %s", err_msg)
                 raise RuntimeError(err_msg)
-            selected_name = getattr(target_cal, "name", "") or self.calendar_name
+            selected_name = self._get_calendar_name(target_cal) or self.calendar_name
         else:
             target_cal = calendars[0]
-            selected_name = getattr(target_cal, "name", "") or "Default"
+            selected_name = self._get_calendar_name(target_cal) or "Default"
 
         self.active_calendar_name = selected_name
         logger.info(
@@ -206,11 +239,7 @@ class CalendarSyncService:
         )
 
         try:
-            client = caldav.DAVClient(
-                url=self.url,
-                username=self.username,
-                password=self.password,
-            )
+            client = self._get_dav_client()
             principal = client.principal()
             calendars = principal.calendars()
             if not calendars:
@@ -220,7 +249,7 @@ class CalendarSyncService:
             target_cal = calendars[0]
             if self.calendar_name:
                 for c in calendars:
-                    c_name = getattr(c, "name", "") or ""
+                    c_name = self._get_calendar_name(c)
                     if c_name.strip().lower() == self.calendar_name.lower():
                         target_cal = c
                         break

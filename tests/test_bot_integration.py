@@ -33,6 +33,7 @@ async def test_normal_text_message_existing_behavior(initialized_db, mock_bot):
 
     with patch.object(bot_module, "DB_PATH", initialized_db), \
          patch.object(bot_module, "DEBOUNCE_DELAY_SECONDS", 0.01), \
+         patch.object(bot_module, "trello_service", None), \
          patch("bot.analyze_context_with_ollama", new=AsyncMock(return_value=ollama_response)):
 
         await bot_module.handle_wife_business_message(wife_msg, mock_bot)
@@ -113,6 +114,7 @@ async def test_voice_message_with_task_creates_task(initialized_db, mock_bot):
 
     with patch.object(bot_module, "DB_PATH", initialized_db), \
          patch.object(bot_module, "DEBOUNCE_DELAY_SECONDS", 0.01), \
+         patch.object(bot_module, "trello_service", None), \
          patch("voice.processor.transcribe_voice", new=AsyncMock(return_value=fake_transcript)), \
          patch("voice.processor.generate_voice_summary", new=AsyncMock(return_value=fake_summary)), \
          patch("bot.analyze_context_with_ollama", new=AsyncMock(return_value=ollama_task_analysis)):
