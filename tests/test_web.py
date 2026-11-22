@@ -314,3 +314,117 @@ async def test_trello_webhook_via_webserver():
     # 4. Обратная совместимость с корневым /trello/webhook
     resp_legacy = await dispatch_request(app, "HEAD", "/trello/webhook")
     assert resp_legacy.status == 200
+
+
+def test_enrich_task_fields_trello_support():
+    """Проверка вычисления полей доступности кнопки 'В Trello'."""
+    # Задача без Trello (не завершена) -> can_add_to_trello = True
+    t1 = {"id": 1, "status": "pending", "trello_card_id": None}
+    e1 = enrich_task_fields(t1)
+    assert e1["is_in_trello"] is False
+    assert e1["can_add_to_trello"] is True
+
+    # Задача уже привязана к Trello -> can_add_to_trello = False, is_in_trello = True
+    t2 = {"id": 2, "status": "pending", "trello_card_id": "card_abc"}
+    e2 = enrich_task_fields(t2)
+    assert e2["is_in_trello"] is True
+    assert e2["can_add_to_trello"] is False
+
+    # Задача завершена (хоть и без Trello) -> can_add_to_trello = False
+    t3 = {"id": 3, "status": "completed", "trello_card_id": None}
+    e3 = enrich_task_fields(t3)
+    assert e3["is_in_trello"] is False
+    assert e3["can_add_to_trello"] is False
+
+
+def test_web_ui_html_rendering_trello_elements():
+    """Проверка наличия кнопки 'В Trello', кнопки 'Sync Trello' и их стилей в HTML."""
+    html = render_html_page(prefix="/pftb", api_prefix="/pftb/api/v1")
+    assert "btn-trello" in html
+    assert "В Trello" in html
+    assert "Sync Trello" in html
+    assert "handleAddToTrello" in html
+    assert "handleSyncTrello" in html
+
+
+@pytest.mark.asyncio
+async def test_api_add_to_trello(initialized_db):
+    """Проверка добавления задачи в Trello через Web API (кнопка 'В Trello')."""
+    t_id = await create_task(
+        "Задача для экспорта в Trello",
+        description="Купить кофе в зернах",
+        db_path=initialized_db,
+    )
+
+    server = WebServer(prefix="/pftb", db_path=initialized_db)
+    app = server.create_app()
+
+    mock_trello = MagicMock()
+    mock_trello.is_enabled = True
+    mock_trello.sync_task_created = AsyncMock(return_value={
+        "card_id": "card_test_trello_111",
+        "card_url": "https://trello.com/c/test111",
+    })
+
+    with patch("bot.trello_service", mock_trello):
+        resp = await dispatch_request(app, "POST", f"/pftb/api/v1/tasks/{t_id}/to_trello")
+        assert resp.status == 200
+        data = json.loads(resp.text)
+        assert data["success"] is True
+        assert data["task"]["trello_card_id"] == "card_test_trello_111"
+        assert data["task"]["trello_card_url"] == "https://trello.com/c/test111"
+        assert data["task"]["is_in_trello"] is True
+        assert data["task"]["can_add_to_trello"] is False
+
+    # Проверяем в БД
+    fresh = await get_task_by_id(t_id, db_path=initialized_db)
+    assert fresh["trello_card_id"] == "card_test_trello_111"
+    assert fresh["trello_card_url"] == "https://trello.com/c/test111"
+
+    # Повторный вызов -> already_in_trello
+    with patch("bot.trello_service", mock_trello):
+        resp_repeat = await dispatch_request(app, "POST", f"/pftb/api/v1/tasks/{t_id}/to_trello")
+        assert resp_repeat.status == 200
+        data_repeat = json.loads(resp_repeat.text)
+        assert data_repeat["success"] is True
+        assert data_repeat["already_in_trello"] is True
+
+
+@pytest.mark.asyncio
+async def test_api_add_to_trello_disabled(initialized_db):
+    """Проверка ошибки при экспорте в Trello, если сервис отключен."""
+    t_id = await create_task("Задача без Trello", db_path=initialized_db)
+
+    server = WebServer(prefix="/pftb", db_path=initialized_db)
+    app = server.create_app()
+
+    mock_trello = MagicMock()
+    mock_trello.is_enabled = False
+
+    with patch("bot.trello_service", mock_trello):
+        resp = await dispatch_request(app, "POST", f"/pftb/api/v1/tasks/{t_id}/to_trello")
+        assert resp.status == 400
+        data = json.loads(resp.text)
+        assert data["success"] is False
+        assert "не включена" in data["error"]
+
+
+@pytest.mark.asyncio
+async def test_api_sync_trello_endpoint(initialized_db):
+    """Проверка эндпоинта ручной синхронизации /pftb/api/v1/trello/sync."""
+    server = WebServer(prefix="/pftb", db_path=initialized_db)
+    app = server.create_app()
+
+    mock_trello = MagicMock()
+    mock_trello.is_enabled = True
+    mock_trello.poll_all_and_sync = AsyncMock(return_value=[
+        {"id": "new_c1", "name": "Новая задача из Trello"}
+    ])
+
+    with patch("bot.trello_service", mock_trello):
+        resp = await dispatch_request(app, "POST", "/pftb/api/v1/trello/sync")
+        assert resp.status == 200
+        data = json.loads(resp.text)
+        assert data["success"] is True
+        assert data["new_tasks_count"] == 1
+        assert "Синхронизация с Trello завершена" in data["message"]

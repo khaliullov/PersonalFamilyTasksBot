@@ -21,14 +21,18 @@ def enrich_task_fields(task: Dict[str, Any]) -> Dict[str, Any]:
     task_copy = dict(task)
     has_deadline = bool(task_copy.get("deadline"))
     is_in_calendar = bool(task_copy.get("caldav_uid"))
+    is_in_trello = bool(task_copy.get("trello_card_id"))
     is_completed = task_copy.get("status") == "completed"
 
     task_copy["has_deadline"] = has_deadline
     task_copy["is_in_calendar"] = is_in_calendar
+    task_copy["is_in_trello"] = is_in_trello
     task_copy["is_completed"] = is_completed
     task_copy["can_complete"] = not is_completed
     # Кнопка 'В календарь' доступна ТОЛЬКО если есть дедлайн, нет caldav_uid и задача не завершена
     task_copy["can_add_to_calendar"] = has_deadline and not is_in_calendar and not is_completed
+    # Кнопка 'В Trello' доступна ТОЛЬКО если нет trello_card_id и задача не завершена
+    task_copy["can_add_to_trello"] = not is_in_trello and not is_completed
     return task_copy
 
 
@@ -192,4 +196,65 @@ async def api_add_to_calendar(request: web.Request) -> web.Response:
         return web.json_response(response_payload, status=status_code)
     except Exception as e:
         logger.exception("Ошибка при добавлении задачи #%d в календарь: %s", task_id, e)
+        return web.json_response({"success": False, "error": str(e)}, status=500)
+
+
+async def api_add_to_trello(request: web.Request) -> web.Response:
+    """
+    Экспорт задачи в Trello (кнопка 'В Trello').
+    """
+    db_path = _get_app_db_path(request)
+    raw_id = request.match_info.get("id", "")
+    if not raw_id.isdigit():
+        return web.json_response({"success": False, "error": "Некорректный ID задачи"}, status=400)
+
+    task_id = int(raw_id)
+    try:
+        from bot import add_task_to_trello
+        result = await add_task_to_trello(task_id, db_path=db_path)
+        status_code = result.get("status", 200)
+
+        response_payload = {
+            "success": result.get("success", False),
+            "message": result.get("message") or result.get("error"),
+        }
+        if result.get("task"):
+            response_payload["task"] = enrich_task_fields(result["task"])
+        if result.get("trello_card_url"):
+            response_payload["trello_card_url"] = result["trello_card_url"]
+        if result.get("error"):
+            response_payload["error"] = result["error"]
+        if result.get("already_in_trello"):
+            response_payload["already_in_trello"] = True
+
+        return web.json_response(response_payload, status=status_code)
+    except Exception as e:
+        logger.exception("Ошибка при добавлении задачи #%d в Trello: %s", task_id, e)
+        return web.json_response({"success": False, "error": str(e)}, status=500)
+
+
+async def api_sync_trello(request: web.Request) -> web.Response:
+    """
+    Запуск ручной синхронизации с Trello (Sync):
+    - Опрашивает карточки в колонках Done и завершает соответствующие задачи.
+    - Импортирует новые карточки из Trello в базу данных с уведомлением в Telegram.
+    - Обновляет измененные карточки.
+    """
+    try:
+        from bot import trello_service
+        if not trello_service or not trello_service.is_enabled:
+            return web.json_response({
+                "success": False,
+                "error": "Интеграция с Trello не включена или не настроены ключи в .env.",
+            }, status=400)
+
+        new_cards = await trello_service.poll_all_and_sync()
+        count = len(new_cards) if isinstance(new_cards, list) else 0
+        return web.json_response({
+            "success": True,
+            "message": f"Синхронизация с Trello завершена! Найдено новых задач: {count}.",
+            "new_tasks_count": count,
+        })
+    except Exception as e:
+        logger.exception("Ошибка при синхронизации с Trello: %s", e)
         return web.json_response({"success": False, "error": str(e)}, status=500)

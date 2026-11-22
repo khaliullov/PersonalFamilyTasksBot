@@ -13,11 +13,13 @@ from trello.config import (
 from trello.webhook import verify_trello_webhook_signature
 from web.api import (
     api_add_to_calendar,
+    api_add_to_trello,
     api_complete_task,
     api_get_stats,
     api_get_task_detail,
     api_get_tasks,
     api_health,
+    api_sync_trello,
 )
 from web.config import (
     API_PREFIX_KEY,
@@ -169,6 +171,8 @@ class WebServer:
         app.router.add_get(f"{self.api_prefix}/tasks/{{id}}", api_get_task_detail)
         app.router.add_post(f"{self.api_prefix}/tasks/{{id}}/complete", api_complete_task)
         app.router.add_post(f"{self.api_prefix}/tasks/{{id}}/to_calendar", api_add_to_calendar)
+        app.router.add_post(f"{self.api_prefix}/tasks/{{id}}/to_trello", api_add_to_trello)
+        app.router.add_post(f"{self.api_prefix}/trello/sync", api_sync_trello)
 
         # 4. Webhook маршруты для Trello
         # Поддерживаем как путь внутри префикса, так и legacy путь TRELLO_WEBHOOK_PATH

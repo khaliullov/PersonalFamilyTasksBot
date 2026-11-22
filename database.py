@@ -672,6 +672,8 @@ async def create_task(
     contact_info: Optional[str] = None,
     caldav_uid: Optional[str] = None,
     caldav_url: Optional[str] = None,
+    trello_card_id: Optional[str] = None,
+    trello_card_url: Optional[str] = None,
     db_path: Optional[str] = None,
 ) -> int:
     """Создает новую задачу/событие в базе данных и возвращает её ID."""
@@ -684,13 +686,15 @@ async def create_task(
                 """
                 INSERT INTO tasks (
                     title, description, deadline, status, created_at, updated_at,
-                    category, location, meeting_url, contact_info, caldav_uid, caldav_url
+                    category, location, meeting_url, contact_info, caldav_uid, caldav_url,
+                    trello_card_id, trello_card_url
                 )
-                VALUES ($1, $2, $3, 'pending', $4, $5, $6, $7, $8, $9, $10, $11)
+                VALUES ($1, $2, $3, 'pending', $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
                 RETURNING id
                 """,
                 title, description, deadline, created_at, created_at,
                 category, location, meeting_url, contact_info, caldav_uid, caldav_url,
+                trello_card_id, trello_card_url,
             )
             return int(task_id)
     else:
@@ -700,13 +704,15 @@ async def create_task(
                 """
                 INSERT INTO tasks (
                     title, description, deadline, status, created_at, updated_at,
-                    category, location, meeting_url, contact_info, caldav_uid, caldav_url
+                    category, location, meeting_url, contact_info, caldav_uid, caldav_url,
+                    trello_card_id, trello_card_url
                 )
-                VALUES (?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     title, description, deadline, created_at, created_at,
                     category, location, meeting_url, contact_info, caldav_uid, caldav_url,
+                    trello_card_id, trello_card_url,
                 ),
             )
             await db.commit()

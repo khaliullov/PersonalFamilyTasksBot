@@ -655,3 +655,236 @@ async def test_cmd_done_moves_card_in_trello(initialized_db):
     )
     fake_message.answer.assert_called_once()
     assert "отмечена как выполненная" in fake_message.answer.call_args.args[0]
+
+
+# ==============================================================================
+# 8. ТЕСТЫ ИМПОРТА ЗАДАЧ ИЗ TRELLO В БАЗУ И УВЕДОМЛЕНИЙ В TELEGRAM
+# ==============================================================================
+
+
+def test_plural_tasks_formatting():
+    """Проверка правильного склонения числительных 'задача'."""
+    assert bot_module._plural_tasks(1) == "Добавлена 1 задача"
+    assert bot_module._plural_tasks(2) == "Добавлены 2 задачи"
+    assert bot_module._plural_tasks(3) == "Добавлены 3 задачи"
+    assert bot_module._plural_tasks(4) == "Добавлены 4 задачи"
+    assert bot_module._plural_tasks(5) == "Добавлено 5 задач"
+    assert bot_module._plural_tasks(10) == "Добавлено 10 задач"
+    assert bot_module._plural_tasks(11) == "Добавлено 11 задач"
+    assert bot_module._plural_tasks(21) == "Добавлена 21 задача"
+    assert bot_module._plural_tasks(22) == "Добавлены 22 задачи"
+
+
+@pytest.mark.asyncio
+async def test_handle_trello_cards_created_single_card(initialized_db, mock_bot):
+    """
+    Проверяет сценарий, когда из Trello добавляется 1 задача:
+    - Задача создается в базе данных.
+    - В TG отправляется подробная сводка как при сообщении жены:
+      Суть, Детали, Дедлайн, ссылка на Trello, inline-кнопки.
+    """
+    card_data = {
+        "id": "card_from_trello_1",
+        "name": "Записаться к стоматологу",
+        "desc": "Клиника на Ленина, врач Иванов",
+        "due": "2026-12-10T15:00:00.000Z",
+        "shortUrl": "https://trello.com/c/dentist1",
+    }
+
+    with patch.object(bot_module, "DB_PATH", initialized_db), \
+         patch.object(bot_module, "_current_bot", mock_bot):
+
+        created = await bot_module.handle_trello_cards_created([card_data], db_path=initialized_db)
+
+    assert len(created) == 1
+    task = created[0]
+    task_id = task["id"]
+    assert task["title"] == "Записаться к стоматологу"
+    assert task["description"] == "Клиника на Ленина, врач Иванов"
+    assert task["trello_card_id"] == "card_from_trello_1"
+    assert task["trello_card_url"] == "https://trello.com/c/dentist1"
+    assert "2026-12-10" in task["deadline"]
+
+    # Проверяем отправку уведомления в Telegram
+    mock_bot.send_message.assert_called_once()
+    kwargs = mock_bot.send_message.call_args.kwargs
+    assert kwargs["chat_id"] == bot_module.MY_ID
+    sent_text = kwargs["text"]
+
+    # Проверяем структуру сводки
+    assert "Добавлена 1 задача из Trello!" in sent_text
+    assert "📌 <b>Суть:</b> Записаться к стоматологу" in sent_text
+    assert "Клиника на Ленина, врач Иванов" in sent_text
+    assert "https://trello.com/c/dentist1" in sent_text
+    assert f"#{task_id}" in sent_text
+
+    # Проверяем наличие inline-кнопок
+    reply_markup = kwargs.get("reply_markup")
+    assert reply_markup is not None
+    button_callbacks = [
+        btn.callback_data for row in reply_markup.inline_keyboard for btn in row
+    ]
+    assert f"done:{task_id}" in button_callbacks
+
+
+@pytest.mark.asyncio
+async def test_handle_trello_cards_created_multiple_cards(initialized_db, mock_bot):
+    """
+    Проверяет сценарий, когда из Trello добавляется сразу несколько задач (например, 10):
+    - Все задачи создаются в базе данных.
+    - В TG отправляется сводное групповое сообщение со списком и ссылками.
+    """
+    cards_data = []
+    for i in range(1, 11):
+        cards_data.append({
+            "id": f"card_batch_{i}",
+            "name": f"Купить товар #{i}",
+            "desc": f"Описание #{i}",
+            "due": None,
+            "shortUrl": f"https://trello.com/c/batch_{i}",
+        })
+
+    with patch.object(bot_module, "DB_PATH", initialized_db), \
+         patch.object(bot_module, "_current_bot", mock_bot):
+
+        created = await bot_module.handle_trello_cards_created(cards_data, db_path=initialized_db)
+
+    assert len(created) == 10
+
+    # Проверяем отправку одного группового сообщения в Telegram
+    mock_bot.send_message.assert_called_once()
+    sent_text = mock_bot.send_message.call_args.kwargs["text"]
+    assert "Добавлено 10 задач из Trello:" in sent_text
+    for i in range(1, 11):
+        assert f"Купить товар #{i}" in sent_text
+        assert f"https://trello.com/c/batch_{i}" in sent_text
+
+
+@pytest.mark.asyncio
+async def test_handle_trello_cards_created_ignores_duplicates(initialized_db, mock_bot):
+    """
+    Проверяет защиту от дублирования:
+    - Если задача с таким trello_card_id уже есть в БД — повторно не создается.
+    - Если карточка была создана ботом с текстом '📌 **Задача #ID' — она привязывается к существующей.
+    """
+    # 1. Существующая задача в БД
+    existing_id = await bot_module.create_task("Существующая задача", db_path=initialized_db)
+    await bot_module.update_task_trello_info(
+        task_id=existing_id,
+        trello_card_id="existing_card_123",
+        trello_card_url="https://trello.com/c/ext123",
+        db_path=initialized_db,
+    )
+
+    # 2. Создаем задачу без карточки
+    bot_task_id = await bot_module.create_task("Задача бота без карточки", db_path=initialized_db)
+
+    cards = [
+        # Дубликат по trello_card_id
+        {
+            "id": "existing_card_123",
+            "name": "Существующая задача",
+            "desc": "Не должно добавиться",
+        },
+        # Карточка с дескрипшеном бота
+        {
+            "id": "card_from_bot_new",
+            "name": "Задача бота без карточки",
+            "desc": f"📌 **Задача #{bot_task_id}** (создана ботом из Telegram)",
+            "shortUrl": "https://trello.com/c/botnew",
+        },
+    ]
+
+    with patch.object(bot_module, "DB_PATH", initialized_db), \
+         patch.object(bot_module, "_current_bot", mock_bot):
+
+        created = await bot_module.handle_trello_cards_created(cards, db_path=initialized_db)
+
+    # Ни одной новой задачи создано не было!
+    assert len(created) == 0
+    mock_bot.send_message.assert_not_called()
+
+    # Проверяем, что bot_task_id получил trello_card_id
+    updated_bot_task = await bot_module.get_task_by_id(bot_task_id, db_path=initialized_db)
+    assert updated_bot_task["trello_card_id"] == "card_from_bot_new"
+
+
+@pytest.mark.asyncio
+async def test_trello_webhook_creates_new_card():
+    """Проверяет обработку вебхука createCard в колонке не-Done (создание новой задачи)."""
+    created_cards = []
+
+    async def on_cards_created(cards):
+        created_cards.extend(cards)
+
+    mock_client = AsyncMock(spec=TrelloClient)
+    mock_client.get_card.return_value = {
+        "id": "card_wh_new",
+        "name": "Срочная покупка",
+        "desc": "Нужно купить хлеб",
+        "due": None,
+        "shortUrl": "https://trello.com/c/whnew",
+    }
+
+    service = TrelloSyncService(
+        api_key="key",
+        token="token",
+        board_id="board_123",
+        client=mock_client,
+    )
+    service.done_list_ids = {"done_list_99"}
+    service._on_cards_created_callback = on_cards_created
+
+    payload_created_in_inbox = {
+        "action": {
+            "type": "createCard",
+            "data": {
+                "card": {"id": "card_wh_new", "name": "Срочная покупка"},
+                "list": {"id": "inbox_list_1", "name": "Inbox"},
+            },
+        }
+    }
+    await service.handle_webhook_payload(payload_created_in_inbox)
+
+    assert len(created_cards) == 1
+    assert created_cards[0]["id"] == "card_wh_new"
+    assert created_cards[0]["name"] == "Срочная покупка"
+
+
+@pytest.mark.asyncio
+async def test_trello_polling_imports_new_cards():
+    """Проверяет, что poll_all_and_sync находит новые карточки на доске и вызывает callback."""
+    created_cards = []
+
+    async def on_cards_created(cards):
+        created_cards.extend(cards)
+
+    mock_client = AsyncMock(spec=TrelloClient)
+    mock_client.get_cards_in_list.return_value = []
+    mock_client.get_cards_on_board.return_value = [
+        {"id": "known_card", "name": "Старая задача", "idList": "inbox_list", "desc": "", "due": None},
+        {"id": "new_card_1", "name": "Новая задача 1", "idList": "inbox_list", "desc": "", "due": None},
+        {"id": "new_card_2", "name": "Новая задача 2", "idList": "inbox_list", "desc": "", "due": None},
+    ]
+
+    async def mock_card_lookup(card_id: str):
+        if card_id == "known_card":
+            return {"id": 1, "trello_card_id": "known_card"}
+        return None
+
+    service = TrelloSyncService(
+        api_key="key",
+        token="token",
+        board_id="board_123",
+        client=mock_client,
+    )
+    service.done_list_ids = {"done_list_99"}
+    service._on_cards_created_callback = on_cards_created
+    service._card_lookup_fn = mock_card_lookup
+
+    with patch.object(TrelloSyncService, "is_enabled", new_callable=PropertyMock, return_value=True):
+        new_cards = await service.poll_all_and_sync()
+
+    assert len(new_cards) == 2
+    assert [c["id"] for c in new_cards] == ["new_card_1", "new_card_2"]
+    assert len(created_cards) == 2

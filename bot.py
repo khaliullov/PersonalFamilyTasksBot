@@ -1119,6 +1119,192 @@ async def handle_trello_card_updated(
             )
 
 
+def _plural_tasks(n: int) -> str:
+    """Склонение слова 'задача' в русском языке для количества n."""
+    if 11 <= n % 100 <= 19:
+        return f"Добавлено {n} задач"
+    rem = n % 10
+    if rem == 1:
+        return f"Добавлена {n} задача"
+    elif 2 <= rem <= 4:
+        return f"Добавлены {n} задачи"
+    else:
+        return f"Добавлено {n} задач"
+
+
+async def handle_trello_cards_created(
+    cards: List[Dict[str, Any]],
+    db_path: Optional[str] = None,
+) -> List[Dict[str, Any]]:
+    """
+    Вызывается TrelloSyncService при обнаружении новых карточек в Trello
+    (через Webhook или периодический/ручной Sync):
+    1. Добавляет каждую новую карточку в базу данных.
+    2. Если задан дедлайн — планирует напоминание в APScheduler.
+    3. Отправляет уведомление в Telegram:
+       - Если добавлена ровно 1 задача — выводит подробную сводку (как при распознании
+         сообщения жены) со ссылкой на карточку Trello и inline-кнопками.
+       - Если добавлено несколько задач — выводит сводный список добавленных задач.
+    """
+    target_path = _get_db_path(db_path)
+    created_tasks: List[Dict[str, Any]] = []
+
+    for c in cards:
+        card_id = c.get("id")
+        card_name = (c.get("name") or "").strip()
+        if not card_id or not card_name:
+            continue
+
+        # Проверяем, нет ли уже этой карточки в БД
+        existing = await get_task_by_trello_card_id(card_id, db_path=target_path)
+        if existing:
+            continue
+
+        card_desc = (c.get("desc") or "").strip()
+        card_url = (
+            c.get("shortUrl")
+            or c.get("url")
+            or f"https://trello.com/c/{c.get('shortLink') or card_id}"
+        )
+
+        # Проверяем, не была ли эта карточка создана ботом ранее
+        if "Задача #" in card_desc:
+            m = re.search(r"Задача #(\d+)", card_desc)
+            if m:
+                try:
+                    ext_id = int(m.group(1))
+                    t_ext = await get_task_by_id(ext_id, db_path=target_path)
+                    if t_ext:
+                        await update_task_trello_info(
+                            task_id=ext_id,
+                            trello_card_id=card_id,
+                            trello_card_url=card_url,
+                            db_path=target_path,
+                        )
+                        continue
+                except Exception:
+                    pass
+
+        # Дедлайн
+        card_due = c.get("due")
+        deadline_str: Optional[str] = None
+        deadline_dt: Optional[datetime] = None
+        if card_due:
+            try:
+                dt = parse_deadline(card_due)
+                if dt:
+                    deadline_dt = dt
+                    deadline_str = dt.strftime("%Y-%m-%d %H:%M:%S")
+            except Exception as e:
+                logger.debug("Не удалось распарсить дедлайн карточки %s: %s", card_id, e)
+
+        # Создаем задачу в базе данных
+        task_id = await create_task(
+            title=card_name,
+            description=card_desc if card_desc else None,
+            deadline=deadline_str,
+            category="task",
+            trello_card_id=card_id,
+            trello_card_url=card_url,
+            db_path=target_path,
+        )
+
+        scheduled = False
+        if deadline_dt and _current_bot and deadline_dt > get_now():
+            try:
+                await schedule_task_job(
+                    scheduler_instance=scheduler,
+                    bot=_current_bot,
+                    task_id=task_id,
+                    title=card_name,
+                    deadline_dt=deadline_dt,
+                    deadline_str=deadline_str,
+                )
+                scheduled = True
+            except Exception as e:
+                logger.error("Ошибка при планировании напоминания для задачи #%d из Trello: %s", task_id, e)
+
+        fresh = await get_task_by_id(task_id, db_path=target_path)
+        if fresh:
+            fresh["_scheduled"] = scheduled
+            created_tasks.append(fresh)
+
+    if not created_tasks:
+        return []
+
+    # Отправка уведомлений в Telegram
+    if _current_bot:
+        if len(created_tasks) == 1:
+            task = created_tasks[0]
+            task_id = task["id"]
+            task_title = task["title"]
+            task_desc = task.get("description")
+            dl_str = task.get("deadline")
+            scheduled = task.get("_scheduled", False)
+            trello_card_url = task.get("trello_card_url")
+
+            if dl_str:
+                deadline_info = f"🕒 <code>{dl_str}</code>"
+                if scheduled:
+                    deadline_info += " <i>(напоминание запланировано)</i>"
+                else:
+                    deadline_info += " ⚠️ <i>(дедлайн уже в прошлом!)</i>"
+            else:
+                deadline_info = "❌ Без дедлайна"
+
+            desc_block = f"\n🔗 <b>Детали / ссылки:</b>\n{html.escape(task_desc)}\n" if task_desc else ""
+            trello_block = f"\n📋 <a href=\"{trello_card_url}\">Открыть карточку в Trello</a>\n" if trello_card_url else ""
+
+            notification_text = (
+                f"📥 <b>Добавлена 1 задача из Trello!</b>\n\n"
+                f"📌 <b>Суть:</b> {html.escape(task_title)}"
+                f"{desc_block}\n"
+                f"📅 <b>Дедлайн:</b> {deadline_info}\n"
+                f"{trello_block}\n"
+                f"<i>Запись сохранена в базу (ID: #{task_id})</i>"
+            )
+
+            has_dl = bool(dl_str)
+            try:
+                await _current_bot.send_message(
+                    chat_id=MY_ID,
+                    text=notification_text,
+                    reply_markup=get_task_inline_keyboard(
+                        task_id,
+                        show_calendar_button=has_dl,
+                        is_in_calendar=False,
+                        has_deadline=has_dl,
+                    ),
+                )
+            except Exception as e:
+                logger.error("Ошибка при отправке уведомления в Telegram о задаче #%d из Trello: %s", task_id, e)
+        else:
+            plural_title = _plural_tasks(len(created_tasks))
+            lines = [f"📥 <b>{plural_title} из Trello:</b>\n"]
+            for t in created_tasks:
+                t_id = t["id"]
+                t_title = html.escape(t["title"])
+                t_url = t.get("trello_card_url")
+                t_dl = f" — 🕒 <code>{t['deadline']}</code>" if t.get("deadline") else ""
+                if t_url:
+                    lines.append(f"• <b>#{t_id}</b> <a href=\"{t_url}\">{t_title}</a>{t_dl}")
+                else:
+                    lines.append(f"• <b>#{t_id}</b> {t_title}{t_dl}")
+            lines.append(f"\n<i>Все задачи успешно сохранены в базу данных.</i>")
+            notification_text = "\n".join(lines)
+
+            try:
+                await _current_bot.send_message(
+                    chat_id=MY_ID,
+                    text=notification_text,
+                    disable_web_page_preview=True,
+                )
+            except Exception as e:
+                logger.error("Ошибка при отправке группового уведомления о задачах Trello: %s", e)
+
+    return created_tasks
+
+
 async def _debounced_process_messages(bot: Bot, user_id: int) -> None:
     """
     Корутина ожидания дебаунса: если новых сообщений нет в течение
@@ -1642,6 +1828,84 @@ async def add_task_to_calendar(
     }
 
 
+async def add_task_to_trello(
+    task_id: int,
+    task: Optional[Dict[str, Any]] = None,
+    db_path: Optional[str] = None,
+) -> Dict[str, Any]:
+    """
+    Экспорт задачи в Trello (кнопка 'В Trello' в Web UI):
+    1. Проверяет наличие и статус задачи.
+    2. Проверяет, не привязана ли она уже к Trello.
+    3. Создает карточку через trello_service.sync_task_created.
+    4. Сохраняет trello_card_id и trello_card_url в БД.
+    """
+    target_path = _get_db_path(db_path)
+    if task is None:
+        task = await get_task_by_id(task_id, db_path=target_path)
+
+    if not task:
+        return {"success": False, "status": 404, "error": f"Задача #{task_id} не найдена."}
+
+    if task.get("trello_card_id"):
+        return {
+            "success": True,
+            "status": 200,
+            "already_in_trello": True,
+            "message": "Эта задача уже привязана к Trello.",
+            "task": task,
+            "trello_card_url": task.get("trello_card_url"),
+        }
+
+    if not (trello_service and trello_service.is_enabled):
+        return {
+            "success": False,
+            "status": 400,
+            "error": "Интеграция с Trello не включена или не настроены ключи в .env.",
+        }
+
+    deadline_dt = parse_deadline(task["deadline"]) if task.get("deadline") else None
+
+    card_data = None
+    try:
+        card_data = await trello_service.sync_task_created(
+            task_id=task_id,
+            title=task["title"],
+            description=task.get("description"),
+            deadline_dt=deadline_dt,
+        )
+    except Exception as e:
+        logger.error("Ошибка при создании карточки Trello для задачи #%d: %s", task_id, e)
+        return {"success": False, "status": 500, "error": f"Ошибка синхронизации с Trello: {e}"}
+
+    if not card_data:
+        return {
+            "success": False,
+            "status": 500,
+            "error": "Не удалось создать карточку в Trello. Проверьте настройки колонок доски.",
+        }
+
+    card_id = card_data["card_id"]
+    card_url = card_data.get("card_url", "")
+
+    await update_task_trello_info(
+        task_id=task_id,
+        trello_card_id=card_id,
+        trello_card_url=card_url,
+        db_path=target_path,
+    )
+    logger.info("Задача #%d успешно синхронизирована в Trello (Card ID: %s, URL: %s)", task_id, card_id, card_url)
+
+    fresh_task = await get_task_by_id(task_id, db_path=target_path)
+    return {
+        "success": True,
+        "status": 200,
+        "message": f"Задача #{task_id} успешно добавлена в Trello!",
+        "task": fresh_task or task,
+        "trello_card_url": card_url,
+    }
+
+
 @router.callback_query(F.data.startswith("to_calendar:"))
 async def callback_to_calendar(
     callback: types.CallbackQuery,
@@ -1750,6 +2014,8 @@ async def on_startup(bot: Bot) -> None:
             scheduler=scheduler,
             on_card_completed=handle_trello_card_completed,
             on_card_updated=handle_trello_card_updated,
+            on_cards_created=handle_trello_cards_created,
+            card_lookup_fn=lambda cid: get_task_by_trello_card_id(cid, db_path=DB_PATH),
             webhook_server=web_server,
         )
 

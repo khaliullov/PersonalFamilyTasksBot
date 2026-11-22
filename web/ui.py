@@ -224,6 +224,14 @@ def render_html_page(prefix: str = WEB_PREFIX, api_prefix: str = API_V1_PREFIX) 
             opacity: 0.9;
         }}
 
+        .btn-trello {{
+            background: var(--trello);
+            color: white;
+        }}
+        .btn-trello:hover {{
+            opacity: 0.9;
+        }}
+
         .btn:disabled {{
             opacity: 0.5;
             cursor: not-allowed;
@@ -804,6 +812,9 @@ def render_html_page(prefix: str = WEB_PREFIX, api_prefix: str = API_V1_PREFIX) 
                 </div>
             </div>
             <div class="header-actions">
+                <button class="btn btn-outline btn-sm" id="btn-sync-trello" onclick="handleSyncTrello()" title="Синхронизировать задачи с Trello">
+                    📋 Sync Trello
+                </button>
                 <button class="btn btn-outline btn-sm" id="btn-refresh" title="Обновить список">
                     🔄 Обновить
                 </button>
@@ -1187,6 +1198,22 @@ def render_html_page(prefix: str = WEB_PREFIX, api_prefix: str = API_V1_PREFIX) 
                     calendarBtn = '';
                 }}
 
+                // Кнопка В Trello
+                let trelloBtn = '';
+                if (t.is_in_trello) {{
+                    trelloBtn = `
+                        <button class="btn btn-outline btn-sm" disabled title="Уже в Trello">
+                            📋 В Trello
+                        </button>
+                    `;
+                }} else if (t.can_add_to_trello) {{
+                    trelloBtn = `
+                        <button class="btn btn-trello btn-sm" onclick="handleAddToTrello(${{t.id}})" id="btn-trello-${{t.id}}">
+                            📋 В Trello
+                        </button>
+                    `;
+                }}
+
                 return `
                     <tr id="task-row-${{t.id}}">
                         <td><span class="badge badge-id">#${{t.id}}</span></td>
@@ -1202,6 +1229,7 @@ def render_html_page(prefix: str = WEB_PREFIX, api_prefix: str = API_V1_PREFIX) 
                             <div class="actions-cell" style="justify-content: flex-end;">
                                 ${{completeBtn}}
                                 ${{calendarBtn}}
+                                ${{trelloBtn}}
                                 <button class="btn btn-outline btn-sm" onclick="openTaskModal(${{t.id}})" title="Детали задачи">
                                     👁
                                 </button>
@@ -1357,6 +1385,81 @@ def render_html_page(prefix: str = WEB_PREFIX, api_prefix: str = API_V1_PREFIX) 
             }}
         }}
 
+        // Действие: В Trello
+        async function handleAddToTrello(taskId) {{
+            const btn = document.getElementById(`btn-trello-${{taskId}}`);
+            if (btn) {{
+                btn.disabled = true;
+                btn.innerHTML = '<span class="loading-spinner"></span>';
+            }}
+
+            try {{
+                const res = await fetch(`${{API_PREFIX}}/tasks/${{taskId}}/to_trello`, {{
+                    method: "POST"
+                }});
+                const data = await res.json();
+                if (data.success) {{
+                    showToast(data.message || "Задача успешно добавлена в Trello!", "success");
+                    const idx = state.tasks.findIndex(t => t.id === taskId);
+                    if (idx !== -1 && data.task) {{
+                        state.tasks[idx] = data.task;
+                        renderTasksTable();
+                    }} else {{
+                        fetchTasks();
+                    }}
+                    fetchStats();
+                    if (state.activeModalTaskId === taskId) {{
+                        openTaskModal(taskId);
+                    }}
+                }} else {{
+                    showToast(data.error || "Не удалось отправить задачу в Trello", "error");
+                    if (btn) {{
+                        btn.disabled = false;
+                        btn.innerHTML = '📋 В Trello';
+                    }}
+                }}
+            }} catch (e) {{
+                console.error("Ошибка отправки в Trello:", e);
+                showToast("Сетевая ошибка при обращении к Trello", "error");
+                if (btn) {{
+                    btn.disabled = false;
+                    btn.innerHTML = '📋 В Trello';
+                }}
+            }}
+        }}
+
+        // Действие: Синхронизация с Trello (Sync)
+        async function handleSyncTrello() {{
+            const btn = document.getElementById("btn-sync-trello");
+            const origContent = btn ? btn.innerHTML : "";
+            if (btn) {{
+                btn.disabled = true;
+                btn.innerHTML = '<span class="loading-spinner"></span> Синхронизация...';
+            }}
+
+            try {{
+                const res = await fetch(`${{API_PREFIX}}/trello/sync`, {{
+                    method: "POST"
+                }});
+                const data = await res.json();
+                if (data.success) {{
+                    showToast(data.message || "Синхронизация с Trello завершена!", "success");
+                    fetchTasks();
+                    fetchStats();
+                }} else {{
+                    showToast(data.error || "Ошибка синхронизации с Trello", "error");
+                }}
+            }} catch (e) {{
+                console.error("Ошибка при ручной синхронизации с Trello:", e);
+                showToast("Сетевая ошибка при синхронизации с Trello", "error");
+            }} finally {{
+                if (btn) {{
+                    btn.disabled = false;
+                    btn.innerHTML = origContent;
+                }}
+            }}
+        }}
+
         // Модальное окно деталей
         async function openTaskModal(taskId) {{
             state.activeModalTaskId = taskId;
@@ -1415,6 +1518,11 @@ def render_html_page(prefix: str = WEB_PREFIX, api_prefix: str = API_V1_PREFIX) 
                 modalBtns += `<button class="btn btn-outline btn-sm" disabled>🗓 В календаре</button>`;
             }} else if (task.can_add_to_calendar) {{
                 modalBtns += `<button class="btn btn-caldav btn-sm" onclick="handleAddToCalendar(${{task.id}})">📅 В календарь</button>`;
+            }}
+            if (task.is_in_trello) {{
+                modalBtns += `<button class="btn btn-outline btn-sm" disabled>📋 В Trello</button>`;
+            }} else if (task.can_add_to_trello) {{
+                modalBtns += `<button class="btn btn-trello btn-sm" onclick="handleAddToTrello(${{task.id}})">📋 В Trello</button>`;
             }}
             actionsContainer.innerHTML = modalBtns;
         }}

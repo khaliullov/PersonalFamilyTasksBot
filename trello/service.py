@@ -84,6 +84,12 @@ class TrelloSyncService:
         self._on_card_updated_callback: Optional[
             Callable[[str, str, Optional[str], Optional[str]], Coroutine[Any, Any, None]]
         ] = None
+        self._on_cards_created_callback: Optional[
+            Callable[[List[Dict[str, Any]]], Coroutine[Any, Any, None]]
+        ] = None
+        self._card_lookup_fn: Optional[
+            Callable[[str], Coroutine[Any, Any, Optional[Dict[str, Any]]]]
+        ] = None
 
         self._webhook_server: Optional[Any] = None
         self._owns_webhook_server = False
@@ -317,8 +323,8 @@ class TrelloSyncService:
                     )
                     is_completed = True
 
-        # 2. Создание карточки непосредственно в Done (createCard)
-        elif action_type == "createCard":
+        # 2. Создание карточки непосредственно в Done (createCard, copyCard, etc.)
+        elif action_type in ("createCard", "copyCard", "emailCard", "moveCardToBoard"):
             list_data = data.get("list", {})
             dest_id = list_data.get("id")
             dest_name = list_data.get("name", "")
@@ -330,6 +336,30 @@ class TrelloSyncService:
                     dest_name,
                 )
                 is_completed = True
+            else:
+                logger.info(
+                    "Вебхук Trello: карточка '%s' (%s) создана в колонке '%s'",
+                    card_name,
+                    card_id,
+                    dest_name,
+                )
+                if self._on_cards_created_callback and card_id:
+                    # Запрашиваем полные данные карточки из Trello API (desc, due, shortUrl)
+                    full_card = None
+                    try:
+                        full_card = await self.client.get_card(card_id)
+                    except Exception as e:
+                        logger.debug("Не удалось запросить полные данные карточки %s: %s", card_id, e)
+                    if not full_card:
+                        full_card = {
+                            "id": card_id,
+                            "name": card_name,
+                            "desc": card_info.get("desc", ""),
+                            "due": card_info.get("due"),
+                            "shortUrl": card_info.get("shortUrl") or f"https://trello.com/c/{card_info.get('shortLink') or card_id}",
+                        }
+                    await self._on_cards_created_callback([full_card])
+                    return
 
         if is_completed and self._on_card_completed_callback:
             await self._on_card_completed_callback(card_id, card_name)
@@ -373,42 +403,103 @@ class TrelloSyncService:
                 if card_id and self._on_card_completed_callback:
                     await self._on_card_completed_callback(card_id, card_name)
 
-    async def poll_active_cards(self) -> None:
+    async def poll_active_and_new_cards(self) -> List[Dict[str, Any]]:
         """
-        Опрашивает все открытые карточки на доске и синхронизирует изменения
-        (название, описание, дедлайн) для активных задач из любых колонок доски.
+        Опрашивает все открытые карточки на доске:
+        - Карточки, которых еще нет в БД, передаются в _on_cards_created_callback (импорт + TG).
+        - Карточки, которые уже есть в БД, синхронизируются через _on_card_updated_callback.
         """
-        if not self.is_enabled or not self._on_card_updated_callback:
-            return
+        if not self.is_enabled:
+            return []
 
         if not hasattr(self.client, "get_cards_on_board"):
-            return
+            return []
 
         cards = await self.client.get_cards_on_board(self.board_id)
+        if not cards:
+            return []
+
+        new_cards: List[Dict[str, Any]] = []
+
         for card in cards:
             card_id = card.get("id")
             card_name = card.get("name", "")
             list_id = card.get("idList")
 
+            if not card_id or not card_name:
+                continue
+
             # Карточки в Done обрабатываются через poll_done_columns
             if self.is_done_list(list_id):
                 continue
 
-            if card_id and card_name:
-                await self._on_card_updated_callback(
-                    card_id,
-                    card_name,
-                    card.get("desc"),
-                    card.get("due"),
-                )
+            # Проверяем, известна ли карточка в БД
+            is_known = False
+            if self._card_lookup_fn:
+                try:
+                    existing_task = await self._card_lookup_fn(card_id)
+                    if existing_task:
+                        is_known = True
+                except Exception as e:
+                    logger.debug("Ошибка в _card_lookup_fn для %s: %s", card_id, e)
+            else:
+                try:
+                    from database import get_task_by_trello_card_id
+                    existing_task = await get_task_by_trello_card_id(card_id)
+                    if existing_task:
+                        is_known = True
+                except Exception as e:
+                    logger.debug("Ошибка при проверке наличия карточки %s в БД: %s", card_id, e)
 
-    async def poll_all_and_sync(self) -> None:
+            if is_known or not self._on_cards_created_callback:
+                if self._on_card_updated_callback:
+                    await self._on_card_updated_callback(
+                        card_id,
+                        card_name,
+                        card.get("desc"),
+                        card.get("due"),
+                    )
+            else:
+                # Проверяем описание на предмет задачи бота "📌 **Задача #..."
+                card_desc = card.get("desc") or ""
+                if "Задача #" in card_desc:
+                    try:
+                        from database import find_active_task_for_trello_card
+                        found_t = await find_active_task_for_trello_card(card_id=card_id, card_title=card_name)
+                        if found_t:
+                            is_known = True
+                    except Exception:
+                        pass
+                    if is_known:
+                        if self._on_card_updated_callback:
+                            await self._on_card_updated_callback(
+                                card_id,
+                                card_name,
+                                card.get("desc"),
+                                card.get("due"),
+                            )
+                        continue
+                new_cards.append(card)
+
+        if new_cards and self._on_cards_created_callback:
+            await self._on_cards_created_callback(new_cards)
+
+        return new_cards
+
+    async def poll_active_cards(self) -> None:
         """
-        Комплексный опрос доски: синхронизация завершенных задач и обновление
-        активных карточек из любых колонок.
+        Опрашивает все открытые карточки на доске и синхронизирует изменения
+        (название, описание, дедлайн) для активных задач из любых колонок доски.
+        """
+        await self.poll_active_and_new_cards()
+
+    async def poll_all_and_sync(self) -> List[Dict[str, Any]]:
+        """
+        Комплексный опрос доски: синхронизация завершенных задач,
+        импорт новых задач из Trello в базу и обновление активных карточек.
         """
         await self.poll_done_columns()
-        await self.poll_active_cards()
+        return await self.poll_active_and_new_cards()
 
     async def _setup_trello_webhook_if_configured(self) -> None:
         """
@@ -463,6 +554,12 @@ class TrelloSyncService:
         on_card_updated: Optional[
             Callable[[str, str, Optional[str], Optional[str]], Coroutine[Any, Any, None]]
         ] = None,
+        on_cards_created: Optional[
+            Callable[[List[Dict[str, Any]]], Coroutine[Any, Any, None]]
+        ] = None,
+        card_lookup_fn: Optional[
+            Callable[[str], Coroutine[Any, Any, Optional[Dict[str, Any]]]]
+        ] = None,
         webhook_server: Optional[Any] = None,
     ) -> bool:
         """
@@ -479,6 +576,8 @@ class TrelloSyncService:
         logger.info("Запуск сервиса синхронизации Trello...")
         self._on_card_completed_callback = on_card_completed
         self._on_card_updated_callback = on_card_updated
+        self._on_cards_created_callback = on_cards_created
+        self._card_lookup_fn = card_lookup_fn
         self._scheduler = scheduler
 
         # 1. Разрешаем колонки доски
