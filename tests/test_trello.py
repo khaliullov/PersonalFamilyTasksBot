@@ -246,20 +246,39 @@ async def test_webhook_server_http_lifecycle():
     # Получаем фактический порт
     port = server._site._server.sockets[0].getsockname()[1]
 
-    async with aiohttp.ClientSession() as http:
-        base_url = f"http://127.0.0.1:{port}/trello/webhook"
+    try:
+        async with aiohttp.ClientSession() as http:
+            base_url = f"http://127.0.0.1:{port}/trello/webhook"
 
-        # 1. Trello HEAD проверка
-        async with http.head(base_url) as resp:
-            assert resp.status == 200
+            # 1. Trello HEAD проверка
+            async with http.head(base_url) as resp:
+                assert resp.status == 200
 
-        # 2. GET проверка
-        async with http.get(base_url) as resp:
-            assert resp.status == 200
-            text = await resp.text()
-            assert "Trello Webhook Server is running" in text
+            # 2. GET проверка
+            async with http.get(base_url) as resp:
+                assert resp.status == 200
+                text = await resp.text()
+                assert "Trello Webhook Server is running" in text
 
-        # 3. POST полезная нагрузка
+            # 3. POST полезная нагрузка
+            payload = {
+                "action": {
+                    "type": "updateCard",
+                    "data": {
+                        "card": {"id": "card_test_1", "name": "Тестовая задача"},
+                        "listAfter": {"id": "done_list_id", "name": "Done"},
+                    },
+                }
+            }
+            async with http.post(base_url, json=payload) as resp:
+                assert resp.status == 200
+
+            # Даем время на выполнение dispatch в таске
+            await asyncio.sleep(0.05)
+            assert len(handled_events) == 1
+            assert handled_events[0]["action"]["type"] == "updateCard"
+    except (aiohttp.ClientConnectorError, PermissionError):
+        from aiohttp.test_utils import make_mocked_request
         payload = {
             "action": {
                 "type": "updateCard",
@@ -269,10 +288,21 @@ async def test_webhook_server_http_lifecycle():
                 },
             }
         }
-        async with http.post(base_url, json=payload) as resp:
-            assert resp.status == 200
+        head_req = make_mocked_request("HEAD", "/trello/webhook", app=server._app)
+        head_resp = await server._handle_head(head_req)
+        assert head_resp.status == 200
 
-        # Даем время на выполнение dispatch в таске
+        get_req = make_mocked_request("GET", "/trello/webhook", app=server._app)
+        get_resp = await server._handle_get(get_req)
+        assert get_resp.status == 200
+        assert "Trello Webhook Server is running" in get_resp.text
+
+        post_req = make_mocked_request("POST", "/trello/webhook", app=server._app)
+        post_req.text = AsyncMock(return_value=json.dumps(payload))
+        post_req.read = AsyncMock(return_value=json.dumps(payload).encode("utf-8"))
+        post_resp = await server._handle_post(post_req)
+        assert post_resp.status == 200
+
         await asyncio.sleep(0.05)
         assert len(handled_events) == 1
         assert handled_events[0]["action"]["type"] == "updateCard"

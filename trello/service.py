@@ -85,7 +85,8 @@ class TrelloSyncService:
             Callable[[str, str, Optional[str], Optional[str]], Coroutine[Any, Any, None]]
         ] = None
 
-        self._webhook_server: Optional[TrelloWebhookServer] = None
+        self._webhook_server: Optional[Any] = None
+        self._owns_webhook_server = False
         self._scheduler: Optional[AsyncIOScheduler] = None
         self._is_running = False
 
@@ -462,11 +463,12 @@ class TrelloSyncService:
         on_card_updated: Optional[
             Callable[[str, str, Optional[str], Optional[str]], Coroutine[Any, Any, None]]
         ] = None,
+        webhook_server: Optional[Any] = None,
     ) -> bool:
         """
         Запускает сервис интеграции с Trello:
         1. Разрешает колонки на доске.
-        2. Запускает встроенный вебхук-сервер (если включен).
+        2. Запускает встроенный вебхук-сервер (или регистрирует в едином web_server).
         3. Настраивает вебхук в Trello (если задан callback URL).
         4. Регистрирует периодическую задачу опроса доски в APScheduler.
         """
@@ -482,17 +484,29 @@ class TrelloSyncService:
         # 1. Разрешаем колонки доски
         await self.resolve_board_lists()
 
-        # 2. Запуск легковесного сервера вебхуков
+        # 2. Запуск легковесного сервера вебхуков или подключение к единому серверу
         if self.webhook_enabled:
-            self._webhook_server = TrelloWebhookServer(
-                event_handler=self.handle_webhook_payload,
-                host=self.webhook_host,
-                port=self.webhook_port,
-                path=self.webhook_path,
-                secret=self.api_secret,
-                callback_url=self.webhook_callback_url,
-            )
-            await self._webhook_server.start()
+            if webhook_server is not None:
+                self._webhook_server = webhook_server
+                self._owns_webhook_server = False
+                if hasattr(webhook_server, "set_trello_handler"):
+                    webhook_server.set_trello_handler(
+                        handler=self.handle_webhook_payload,
+                        secret=self.api_secret,
+                        callback_url=self.webhook_callback_url,
+                    )
+                logger.info("Вебхуки Trello подключены к единому Web-серверу приложения.")
+            else:
+                self._webhook_server = TrelloWebhookServer(
+                    event_handler=self.handle_webhook_payload,
+                    host=self.webhook_host,
+                    port=self.webhook_port,
+                    path=self.webhook_path,
+                    secret=self.api_secret,
+                    callback_url=self.webhook_callback_url,
+                )
+                self._owns_webhook_server = True
+                await self._webhook_server.start()
 
             # 3. Попытка автоматической регистрации вебхука в Trello
             if self.webhook_callback_url:
@@ -523,9 +537,10 @@ class TrelloSyncService:
 
         logger.info("Остановка сервиса TrelloSyncService...")
 
-        # Останавливаем вебхук-сервер
+        # Останавливаем вебхук-сервер (только если владели им)
         if self._webhook_server:
-            await self._webhook_server.stop()
+            if getattr(self, "_owns_webhook_server", True) and hasattr(self._webhook_server, "stop"):
+                await self._webhook_server.stop()
             self._webhook_server = None
 
         # Снимаем задачу из планировщика

@@ -45,6 +45,15 @@ from tz_utils import (
     format_dt,
     get_now,
 )
+from web import (
+    API_V1_PREFIX,
+    WEB_ENABLED,
+    WEB_HOST,
+    WEB_PORT,
+    WEB_PREFIX,
+    WEB_UI_PATH,
+    WebServer,
+)
 
 # ==============================================================================
 # КОНФИГУРАЦИЯ И КОНСТАНТЫ
@@ -101,6 +110,18 @@ trello_service = TrelloSyncService()
 # Сервис синхронизации событий с Apple Calendar (CalDAV)
 calendar_service = CalendarSyncService()
 
+# Единый Web-сервер приложения (Web UI, REST API, Callbacks)
+web_server: Optional[WebServer] = (
+    WebServer(
+        host=WEB_HOST,
+        port=WEB_PORT,
+        prefix=WEB_PREFIX,
+        db_path=DB_PATH,
+    )
+    if WEB_ENABLED
+    else None
+)
+
 # ==============================================================================
 # РАБОТА С БАЗОЙ ДАННЫХ (PostgreSQL / SQLite)
 # ==============================================================================
@@ -116,6 +137,8 @@ from database import (
     get_recent_chat_history,
     get_task_by_id,
     get_task_by_trello_card_id,
+    get_task_stats,
+    get_tasks,
     init_db,
     save_chat_message,
     update_task,
@@ -1525,6 +1548,100 @@ async def callback_noop(callback: types.CallbackQuery) -> None:
     await callback.answer("Эта задача уже отмечена как выполненная.", show_alert=False)
 
 
+async def add_task_to_calendar(
+    task_id: int,
+    task: Optional[Dict[str, Any]] = None,
+    db_path: Optional[str] = None,
+    enforce_deadline: bool = True,
+) -> Dict[str, Any]:
+    """
+    Единая логика добавления задачи в Apple Calendar (CalDAV):
+    1. Проверяет статус задачи.
+    2. Проверяет наличие дедлайна (по аналогии с логикой Telegram inline-клавиатуры).
+    3. Создает событие через CalendarSyncService.
+    4. Обновляет категорию на 'calendar', caldav_uid и caldav_url в БД.
+    5. Планирует напоминание в APScheduler, если дата в будущем.
+    """
+    target_path = _get_db_path(db_path)
+    if task is None:
+        task = await get_task_by_id(task_id, db_path=target_path)
+
+    if not task:
+        return {"success": False, "status": 404, "error": f"Задача #{task_id} не найдена."}
+
+    if task.get("status") == "completed":
+        return {"success": False, "status": 400, "error": f"Задача #{task_id} уже выполнена!"}
+
+    if task.get("caldav_uid"):
+        return {
+            "success": True,
+            "status": 200,
+            "already_in_calendar": True,
+            "message": "Это событие уже занесено в Apple Calendar.",
+            "task": task,
+            "caldav_uid": task["caldav_uid"],
+        }
+
+    if enforce_deadline and not task.get("deadline"):
+        return {
+            "success": False,
+            "status": 400,
+            "error": "Невозможно добавить в календарь: у задачи нет дедлайна.",
+        }
+
+    start_dt = resolve_event_datetime(task)
+    new_deadline_str = start_dt.strftime("%Y-%m-%d %H:%M:%S")
+
+    caldav_info = None
+    if calendar_service and calendar_service.is_enabled:
+        try:
+            caldav_info = await calendar_service.create_event(
+                title=task["title"],
+                start_dt=start_dt,
+                location=task.get("location"),
+                description=task.get("description"),
+                meeting_url=task.get("meeting_url"),
+                contact_info=task.get("contact_info"),
+            )
+        except Exception as e:
+            logger.error("Ошибка при создании события в CalDAV для задачи #%d: %s", task_id, e)
+            return {"success": False, "status": 500, "error": f"Ошибка синхронизации с Apple Calendar: {e}"}
+
+    caldav_uid = caldav_info["uid"] if caldav_info else None
+    caldav_url = caldav_info.get("url", "") if caldav_info else None
+
+    await update_task(
+        task_id=task_id,
+        category="calendar",
+        deadline=new_deadline_str if not task.get("deadline") else None,
+        caldav_uid=caldav_uid,
+        caldav_url=caldav_url,
+        db_path=target_path,
+    )
+    logger.info("Задача #%d переведена в категорию 'calendar' (CalDAV UID: %s)", task_id, caldav_uid)
+
+    if _current_bot and start_dt > get_now():
+        await schedule_task_job(
+            scheduler_instance=scheduler,
+            bot=_current_bot,
+            task_id=task_id,
+            title=task["title"],
+            deadline_dt=start_dt,
+            deadline_str=new_deadline_str,
+        )
+
+    updated_task = await get_task_by_id(task_id, db_path=target_path)
+    msg = "📅 Добавлено в Apple Calendar!" if caldav_info else "🗓 Категория обновлена на 'Календарь'. CalDAV не настроен."
+    return {
+        "success": True,
+        "status": 200,
+        "message": msg,
+        "task": updated_task,
+        "caldav_uid": caldav_uid,
+        "caldav_url": caldav_url,
+    }
+
+
 @router.callback_query(F.data.startswith("to_calendar:"))
 async def callback_to_calendar(
     callback: types.CallbackQuery,
@@ -1543,87 +1660,13 @@ async def callback_to_calendar(
 
     task_id = int(parts[1])
     target_path = _get_db_path(db_path)
-    task = await get_task_by_id(task_id, db_path=target_path)
-    if not task:
-        await callback.answer(f"Задача #{task_id} не найдена.", show_alert=True)
+    res = await add_task_to_calendar(task_id, db_path=target_path, enforce_deadline=False)
+    if not res.get("success"):
+        await callback.answer(res.get("error", "Ошибка при добавлении в календарь"), show_alert=True)
         return
 
-    if task.get("status") == "completed":
-        await callback.answer(f"Задача #{task_id} уже выполнена!", show_alert=True)
-        return
-
-    if task.get("caldav_uid"):
-        await callback.answer("Это событие уже занесено в Apple Calendar.", show_alert=False)
-        try:
-            if callback.message and callback.message.reply_markup:
-                old_rows = callback.message.reply_markup.inline_keyboard
-                if len(old_rows) <= 1:
-                    cal_markup = get_task_inline_keyboard(task_id, show_calendar_button=False, is_in_calendar=True)
-                    await callback.message.edit_reply_markup(reply_markup=cal_markup)
-                else:
-                    new_rows = []
-                    for row in old_rows:
-                        new_row = []
-                        for btn in row:
-                            if btn.callback_data == f"to_calendar:{task_id}":
-                                new_row.append(types.InlineKeyboardButton(text="🗓 В календаре", callback_data="noop_cal"))
-                            else:
-                                new_row.append(btn)
-                        new_rows.append(new_row)
-                    await callback.message.edit_reply_markup(reply_markup=types.InlineKeyboardMarkup(inline_keyboard=new_rows))
-        except Exception:
-            pass
-        return
-
-    # Определяем дату и время начала события
-    start_dt = resolve_event_datetime(task)
-    new_deadline_str = start_dt.strftime("%Y-%m-%d %H:%M:%S")
-
-    caldav_info = None
-    if calendar_service and calendar_service.is_enabled:
-        try:
-            caldav_info = await calendar_service.create_event(
-                title=task["title"],
-                start_dt=start_dt,
-                location=task.get("location"),
-                description=task.get("description"),
-                meeting_url=task.get("meeting_url"),
-                contact_info=task.get("contact_info"),
-            )
-        except Exception as e:
-            logger.error("Ошибка при создании события в CalDAV для задачи #%d: %s", task_id, e)
-            await callback.answer("⚠️ Ошибка синхронизации с Apple Calendar.", show_alert=True)
-            return
-
-    caldav_uid = caldav_info["uid"] if caldav_info else None
-    caldav_url = caldav_info.get("url", "") if caldav_info else None
-
-    # Обновляем задачу в базе данных (категория -> calendar, caldav_uid, caldav_url)
-    await update_task(
-        task_id=task_id,
-        category="calendar",
-        deadline=new_deadline_str if not task.get("deadline") else None,
-        caldav_uid=caldav_uid,
-        caldav_url=caldav_url,
-        db_path=target_path,
-    )
-    logger.info("Задача #%d переведена в категорию 'calendar' (CalDAV UID: %s)", task_id, caldav_uid)
-
-    # Если дедлайн в будущем — планируем напоминание в APScheduler
-    if _current_bot and start_dt > get_now():
-        await schedule_task_job(
-            scheduler_instance=scheduler,
-            bot=_current_bot,
-            task_id=task_id,
-            title=task["title"],
-            deadline_dt=start_dt,
-            deadline_str=new_deadline_str,
-        )
-
-    if caldav_info:
-        await callback.answer("📅 Добавлено в Apple Calendar!", show_alert=False)
-    else:
-        await callback.answer("🗓 Категория обновлена на 'Календарь'. CalDAV не настроен.", show_alert=True)
+    is_already = res.get("already_in_calendar", False)
+    await callback.answer(res.get("message", "ОК"), show_alert=False)
 
     try:
         if callback.message and callback.message.reply_markup:
@@ -1697,12 +1740,17 @@ async def on_startup(bot: Bot) -> None:
 
     await restore_scheduled_jobs(bot, scheduler, DB_PATH)
 
+    # Запуск единого Web-сервера приложения (Web UI, REST API, Callbacks)
+    if web_server:
+        await web_server.start()
+
     # Инициализация и запуск сервиса синхронизации Trello
     if trello_service and trello_service.is_enabled:
         await trello_service.start(
             scheduler=scheduler,
             on_card_completed=handle_trello_card_completed,
             on_card_updated=handle_trello_card_updated,
+            webhook_server=web_server,
         )
 
     # Проверка подключения к Apple Calendar (CalDAV) при старте бота, если включен в конфиге
@@ -1717,6 +1765,8 @@ async def on_startup(bot: Bot) -> None:
 async def on_shutdown() -> None:
     """Корректное завершение работы бота."""
     logger.info("Остановка бота...")
+    if web_server:
+        await web_server.stop()
     if trello_service and trello_service.is_enabled:
         await trello_service.stop()
     if scheduler.running:

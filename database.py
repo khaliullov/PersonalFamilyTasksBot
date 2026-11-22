@@ -1025,6 +1025,163 @@ async def get_active_tasks(db_path: Optional[str] = None) -> List[Dict[str, Any]
                 return [dict(row) for row in rows]
 
 
+async def get_tasks(
+    status: Optional[str] = None,
+    category: Optional[str] = None,
+    search: Optional[str] = None,
+    limit: int = 10,
+    offset: int = 0,
+    sort_by: str = "id",
+    sort_order: str = "desc",
+    db_path: Optional[str] = None,
+) -> Tuple[List[Dict[str, Any]], int]:
+    """
+    Возвращает список задач с пагинацией, фильтрацией и общим количеством.
+    status: 'all', 'active' (pending, reminded), 'completed', 'pending', 'reminded'
+    category: фильтр по категории (например, 'task', 'calendar')
+    search: поиск по названию, описанию, месту и контакту
+    limit: количество задач на страницу (1..100)
+    offset: смещение
+    sort_by: поле сортировки ('id', 'deadline', 'created_at', 'updated_at', 'status', 'title')
+    sort_order: 'desc' или 'asc'
+    """
+    valid_sort_fields = {"id", "deadline", "created_at", "updated_at", "status", "category", "title"}
+    field = sort_by if sort_by in valid_sort_fields else "id"
+    direction = "ASC" if str(sort_order).lower() == "asc" else "DESC"
+    safe_limit = max(1, min(int(limit), 100))
+    safe_offset = max(0, int(offset))
+
+    if is_postgres_configured(db_path):
+        where_clauses = []
+        params = []
+        p_idx = 1
+
+        if status:
+            s = status.strip().lower()
+            if s == "active":
+                where_clauses.append("status IN ('pending', 'reminded')")
+            elif s != "all":
+                where_clauses.append(f"status = ${p_idx}")
+                params.append(s)
+                p_idx += 1
+
+        if category and category.strip().lower() != "all":
+            where_clauses.append(f"category = ${p_idx}")
+            params.append(category.strip())
+            p_idx += 1
+
+        if search and search.strip():
+            term = f"%{search.strip()}%"
+            where_clauses.append(
+                f"(title ILIKE ${p_idx} OR description ILIKE ${p_idx+1} OR location ILIKE ${p_idx+2} OR contact_info ILIKE ${p_idx+3})"
+            )
+            params.extend([term, term, term, term])
+            p_idx += 4
+
+        where_sql = f"WHERE {' AND '.join(where_clauses)}" if where_clauses else ""
+        count_query = f"SELECT COUNT(*) FROM tasks {where_sql}"
+        select_query = f"""
+            SELECT id, title, description, deadline, status, created_at, updated_at,
+                   trello_card_id, trello_card_url, category, location, meeting_url,
+                   contact_info, caldav_uid, caldav_url
+            FROM tasks
+            {where_sql}
+            ORDER BY {field} {direction}
+            LIMIT ${p_idx} OFFSET ${p_idx+1}
+        """
+        select_params = list(params) + [safe_limit, safe_offset]
+
+        pool = await get_pg_pool()
+        async with pool.acquire() as conn:
+            total = await conn.fetchval(count_query, *params)
+            rows = await conn.fetch(select_query, *select_params)
+            return [dict(row) for row in rows], int(total or 0)
+    else:
+        target_path = _get_db_path(db_path)
+        where_clauses = []
+        params = []
+
+        if status:
+            s = status.strip().lower()
+            if s == "active":
+                where_clauses.append("status IN ('pending', 'reminded')")
+            elif s != "all":
+                where_clauses.append("status = ?")
+                params.append(s)
+
+        if category and category.strip().lower() != "all":
+            where_clauses.append("category = ?")
+            params.append(category.strip())
+
+        if search and search.strip():
+            term = f"%{search.strip().lower()}%"
+            where_clauses.append(
+                "(lower(title) LIKE ? OR lower(COALESCE(description, '')) LIKE ? OR lower(COALESCE(location, '')) LIKE ? OR lower(COALESCE(contact_info, '')) LIKE ?)"
+            )
+            params.extend([term, term, term, term])
+
+        where_sql = f"WHERE {' AND '.join(where_clauses)}" if where_clauses else ""
+        count_query = f"SELECT COUNT(*) FROM tasks {where_sql}"
+        select_query = f"""
+            SELECT id, title, description, deadline, status, created_at, updated_at,
+                   trello_card_id, trello_card_url, category, location, meeting_url,
+                   contact_info, caldav_uid, caldav_url
+            FROM tasks
+            {where_sql}
+            ORDER BY {field} {direction}
+            LIMIT ? OFFSET ?
+        """
+        select_params = list(params) + [safe_limit, safe_offset]
+
+        async with aiosqlite.connect(target_path) as db:
+            await db.create_function("lower", 1, lambda s: s.lower() if s is not None else "")
+            db.row_factory = aiosqlite.Row
+            async with db.execute(count_query, params) as cursor:
+                count_row = await cursor.fetchone()
+                total = count_row[0] if count_row else 0
+            async with db.execute(select_query, select_params) as cursor:
+                rows = await cursor.fetchall()
+                return [dict(row) for row in rows], int(total or 0)
+
+
+async def get_task_stats(db_path: Optional[str] = None) -> Dict[str, int]:
+    """Возвращает агрегированную статистику по задачам: всего, активных, выполненных, в календаре."""
+    query = """
+        SELECT
+            COUNT(*) as total,
+            COALESCE(SUM(CASE WHEN status IN ('pending', 'reminded') THEN 1 ELSE 0 END), 0) as active,
+            COALESCE(SUM(CASE WHEN status = 'pending' THEN 1 ELSE 0 END), 0) as pending,
+            COALESCE(SUM(CASE WHEN status = 'reminded' THEN 1 ELSE 0 END), 0) as reminded,
+            COALESCE(SUM(CASE WHEN status = 'completed' THEN 1 ELSE 0 END), 0) as completed,
+            COALESCE(SUM(CASE WHEN caldav_uid IS NOT NULL AND caldav_uid != '' THEN 1 ELSE 0 END), 0) as in_calendar
+        FROM tasks
+    """
+    default_stats = {
+        "total": 0,
+        "active": 0,
+        "pending": 0,
+        "reminded": 0,
+        "completed": 0,
+        "in_calendar": 0,
+    }
+    if is_postgres_configured(db_path):
+        pool = await get_pg_pool()
+        async with pool.acquire() as conn:
+            row = await conn.fetchrow(query)
+            if not row:
+                return default_stats
+            return {k: int(row[k] or 0) for k in default_stats}
+    else:
+        target_path = _get_db_path(db_path)
+        async with aiosqlite.connect(target_path) as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute(query) as cursor:
+                row = await cursor.fetchone()
+                if not row:
+                    return default_stats
+                return {k: int(row[k] or 0) for k in default_stats}
+
+
 # ==============================================================================
 # ОПЕРАЦИИ С ГОЛОСОВЫМИ СООБЩЕНИЯМИ (voice_messages)
 # ==============================================================================
