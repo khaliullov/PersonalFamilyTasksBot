@@ -203,6 +203,99 @@ class TrelloClient:
             logger.error("Сетевая ошибка при обновлении карточки Trello %s: %s", card_id, e)
             return None
 
+    async def get_card_attachments(self, card_id: str) -> List[Dict[str, Any]]:
+        """
+        Возвращает список вложений (attachments) для указанной карточки Trello.
+        """
+        url = f"{self.base_url}/cards/{card_id}/attachments"
+        params = self._auth_params()
+        session = await self._get_session()
+
+        try:
+            async with session.get(url, params=params) as resp:
+                if resp.status != 200:
+                    logger.warning(
+                        "Не удалось получить список вложений карточки %s: HTTP %d",
+                        card_id,
+                        resp.status,
+                    )
+                    return []
+                data = await resp.json()
+                return data if isinstance(data, list) else []
+        except Exception as e:
+            logger.error("Сетевая ошибка при получении вложений карточки %s: %s", card_id, type(e).__name__)
+            return []
+
+    async def upload_card_attachment(
+        self,
+        card_id: str,
+        file_path: str,
+        *,
+        filename: Optional[str] = None,
+        mime_type: str = "image/jpeg",
+        name: Optional[str] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Загружает локальный файл напрямую на карточку Trello через официальный
+        multipart/form-data эндпоинт POST /1/cards/{id}/attachments.
+        Не использует временные Telegram URL или локальные пути в качестве URL вложения.
+        """
+        import os
+
+        if not card_id or not file_path or not os.path.isfile(file_path):
+            logger.error("Невозможно загрузить вложение в Trello: отсутствует файл или card_id.")
+            return None
+
+        safe_filename = os.path.basename(filename or file_path) or "photo.jpg"
+        display_name = name or safe_filename
+        url = f"{self.base_url}/cards/{card_id}/attachments"
+        params = self._auth_params()
+        session = await self._get_session()
+
+        def _read_bytes(path: str) -> bytes:
+            with open(path, "rb") as fh:
+                return fh.read()
+
+        try:
+            file_bytes = await asyncio.to_thread(_read_bytes, file_path)
+            if not file_bytes:
+                logger.error("Невозможно загрузить пустой файл вложения на карточку %s.", card_id)
+                return None
+
+            form = aiohttp.FormData()
+            form.add_field("name", display_name)
+            form.add_field("mimeType", mime_type)
+            form.add_field(
+                "file",
+                file_bytes,
+                filename=safe_filename,
+                content_type=mime_type,
+            )
+
+            async with session.post(url, params=params, data=form) as resp:
+                if resp.status not in (200, 201):
+                    logger.error(
+                        "Не удалось загрузить вложение на карточку Trello %s: HTTP %d",
+                        card_id,
+                        resp.status,
+                    )
+                    return None
+                data = await resp.json()
+                logger.info(
+                    "Вложение успешно прикреплено к карточке Trello %s (attachment_id=%s, bytes=%d)",
+                    card_id,
+                    data.get("id") if isinstance(data, dict) else None,
+                    len(file_bytes),
+                )
+                return data if isinstance(data, dict) else None
+        except Exception as e:
+            logger.error(
+                "Сетевая ошибка при загрузке вложения на карточку Trello %s: %s",
+                card_id,
+                type(e).__name__,
+            )
+            return None
+
     async def list_webhooks(self) -> List[Dict[str, Any]]:
         """
         Возвращает список всех зарегистрированных вебхуков для текущего токена.

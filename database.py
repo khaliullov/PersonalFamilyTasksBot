@@ -249,11 +249,66 @@ async def init_postgres_schema(pool: Any) -> None:
             """
         )
 
+        # Таблица vision_images (метаданные обработки изображений и вложений Trello)
+        await conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS vision_images (
+                id SERIAL PRIMARY KEY,
+                chat_id BIGINT NOT NULL,
+                telegram_message_id BIGINT NOT NULL,
+                business_connection_id TEXT,
+                sender_id BIGINT NOT NULL,
+                telegram_file_id TEXT,
+                telegram_file_unique_id TEXT,
+                media_group_id TEXT,
+                caption TEXT,
+                local_file_path TEXT,
+                original_filename TEXT,
+                mime_type TEXT,
+                file_size BIGINT,
+                sha256_hash TEXT,
+                vision_status TEXT NOT NULL DEFAULT 'pending',
+                analysis_json TEXT,
+                image_description TEXT,
+                short_summary TEXT,
+                ocr_text TEXT,
+                category TEXT,
+                confidence DOUBLE PRECISION,
+                task_id INTEGER,
+                trello_card_id TEXT,
+                trello_attachment_id TEXT,
+                attachment_status TEXT NOT NULL DEFAULT 'none',
+                retry_count INTEGER NOT NULL DEFAULT 0,
+                last_error TEXT,
+                context_saved INTEGER NOT NULL DEFAULT 0,
+                clarification_sent INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                CONSTRAINT uq_vision_chat_msg UNIQUE(chat_id, telegram_message_id)
+            );
+            """
+        )
+
         # Индексы
         await conn.execute(
             """
             CREATE INDEX IF NOT EXISTS idx_voice_messages_chat_msg
             ON voice_messages(chat_id, telegram_message_id);
+
+            CREATE INDEX IF NOT EXISTS idx_vision_images_chat_msg
+            ON vision_images(chat_id, telegram_message_id);
+
+            CREATE INDEX IF NOT EXISTS idx_vision_images_media_group
+            ON vision_images(chat_id, media_group_id);
+
+            CREATE INDEX IF NOT EXISTS idx_vision_images_task_id
+            ON vision_images(task_id);
+
+            CREATE INDEX IF NOT EXISTS idx_vision_images_attachment_status
+            ON vision_images(attachment_status);
+
+            CREATE INDEX IF NOT EXISTS idx_vision_images_card_hash
+            ON vision_images(trello_card_id, sha256_hash);
 
             CREATE INDEX IF NOT EXISTS idx_tasks_status
             ON tasks(status);
@@ -365,6 +420,75 @@ async def init_sqlite_schema(target_path: str) -> None:
             ON voice_messages(chat_id, telegram_message_id)
             """
         )
+
+        await db.execute(
+            """
+            CREATE TABLE IF NOT EXISTS vision_images (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                chat_id INTEGER NOT NULL,
+                telegram_message_id INTEGER NOT NULL,
+                business_connection_id TEXT,
+                sender_id INTEGER NOT NULL,
+                telegram_file_id TEXT,
+                telegram_file_unique_id TEXT,
+                media_group_id TEXT,
+                caption TEXT,
+                local_file_path TEXT,
+                original_filename TEXT,
+                mime_type TEXT,
+                file_size INTEGER,
+                sha256_hash TEXT,
+                vision_status TEXT NOT NULL DEFAULT 'pending',
+                analysis_json TEXT,
+                image_description TEXT,
+                short_summary TEXT,
+                ocr_text TEXT,
+                category TEXT,
+                confidence REAL,
+                task_id INTEGER,
+                trello_card_id TEXT,
+                trello_attachment_id TEXT,
+                attachment_status TEXT NOT NULL DEFAULT 'none',
+                retry_count INTEGER NOT NULL DEFAULT 0,
+                last_error TEXT,
+                context_saved INTEGER NOT NULL DEFAULT 0,
+                clarification_sent INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                UNIQUE(chat_id, telegram_message_id)
+            )
+            """
+        )
+        await db.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_vision_images_chat_msg
+            ON vision_images(chat_id, telegram_message_id)
+            """
+        )
+        await db.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_vision_images_media_group
+            ON vision_images(chat_id, media_group_id)
+            """
+        )
+        await db.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_vision_images_task_id
+            ON vision_images(task_id)
+            """
+        )
+        await db.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_vision_images_attachment_status
+            ON vision_images(attachment_status)
+            """
+        )
+        await db.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_vision_images_card_hash
+            ON vision_images(trello_card_id, sha256_hash)
+            """
+        )
         await db.commit()
 
 
@@ -376,12 +500,12 @@ async def migrate_sqlite_to_postgres(sqlite_path: str = "tasks.db", pool: Option
     """
     if not os.path.exists(sqlite_path):
         logger.info("Файл SQLite '%s' не найден, миграция данных пропущена.", sqlite_path)
-        return {"tasks": 0, "chat_history": 0, "voice_messages": 0}
+        return {"tasks": 0, "chat_history": 0, "voice_messages": 0, "vision_images": 0}
 
     if pool is None:
         pool = await get_pg_pool()
 
-    counts = {"tasks": 0, "chat_history": 0, "voice_messages": 0}
+    counts = {"tasks": 0, "chat_history": 0, "voice_messages": 0, "vision_images": 0}
 
     import sqlite3
     sqlite_conn = sqlite3.connect(sqlite_path)
@@ -494,6 +618,62 @@ async def migrate_sqlite_to_postgres(sqlite_path: str = "tasks.db", pool: Option
         except Exception as e:
             logger.error("Ошибка при переносе таблицы voice_messages из SQLite: %s", e)
 
+        # 4. Миграция vision_images (если таблица существует в SQLite)
+        try:
+            sqlite_cur.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name='vision_images'"
+            )
+            if sqlite_cur.fetchone():
+                sqlite_cur.execute(
+                    """
+                    SELECT id, chat_id, telegram_message_id, business_connection_id, sender_id,
+                           telegram_file_id, telegram_file_unique_id, media_group_id, caption,
+                           local_file_path, original_filename, mime_type, file_size, sha256_hash,
+                           vision_status, analysis_json, image_description, short_summary,
+                           ocr_text, category, confidence, task_id, trello_card_id,
+                           trello_attachment_id, attachment_status, retry_count, last_error,
+                           context_saved, clarification_sent, created_at, updated_at
+                    FROM vision_images
+                    ORDER BY id ASC
+                    """
+                )
+                rows = sqlite_cur.fetchall()
+                for r in rows:
+                    await pg_conn.execute(
+                        """
+                        INSERT INTO vision_images (
+                            id, chat_id, telegram_message_id, business_connection_id, sender_id,
+                            telegram_file_id, telegram_file_unique_id, media_group_id, caption,
+                            local_file_path, original_filename, mime_type, file_size, sha256_hash,
+                            vision_status, analysis_json, image_description, short_summary,
+                            ocr_text, category, confidence, task_id, trello_card_id,
+                            trello_attachment_id, attachment_status, retry_count, last_error,
+                            context_saved, clarification_sent, created_at, updated_at
+                        )
+                        VALUES (
+                            $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14,
+                            $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26,
+                            $27, $28, $29, $30, $31
+                        )
+                        ON CONFLICT (chat_id, telegram_message_id) DO NOTHING
+                        """,
+                        r["id"], r["chat_id"], r["telegram_message_id"], r["business_connection_id"],
+                        r["sender_id"], r["telegram_file_id"], r["telegram_file_unique_id"],
+                        r["media_group_id"], r["caption"], r["local_file_path"], r["original_filename"],
+                        r["mime_type"], r["file_size"], r["sha256_hash"], r["vision_status"],
+                        r["analysis_json"], r["image_description"], r["short_summary"], r["ocr_text"],
+                        r["category"], r["confidence"], r["task_id"], r["trello_card_id"],
+                        r["trello_attachment_id"], r["attachment_status"], r["retry_count"],
+                        r["last_error"], r["context_saved"], r["clarification_sent"],
+                        r["created_at"], r["updated_at"],
+                    )
+                counts["vision_images"] = len(rows)
+                await pg_conn.execute(
+                    "SELECT setval('vision_images_id_seq', COALESCE((SELECT MAX(id) FROM vision_images), 1));"
+                )
+        except Exception as e:
+            logger.error("Ошибка при переносе таблицы vision_images из SQLite: %s", e)
+
     sqlite_conn.close()
     logger.info(
         "🎉 Миграция SQLite -> PostgreSQL успешно выполнена! Перенесено: %d задач, %d записей истории, %d голосовых сообщений.",
@@ -573,7 +753,7 @@ async def get_recent_chat_history(
         async with pool.acquire() as conn:
             rows = await conn.fetch(
                 """
-                SELECT id, sender_id, sender_name, text, created_at
+                SELECT id, sender_id, sender_name, text, created_at, source_message_id, message_type
                 FROM chat_history
                 ORDER BY id DESC
                 LIMIT $1
@@ -587,7 +767,7 @@ async def get_recent_chat_history(
             db.row_factory = aiosqlite.Row
             async with db.execute(
                 """
-                SELECT id, sender_id, sender_name, text, created_at
+                SELECT id, sender_id, sender_name, text, created_at, source_message_id, message_type
                 FROM chat_history
                 ORDER BY id DESC
                 LIMIT ?
@@ -1361,6 +1541,439 @@ async def update_voice_message(
             cursor = await db.execute(query, values)
             await db.commit()
             return cursor.rowcount > 0
+
+
+# ==============================================================================
+# ОПЕРАЦИИ С ИЗОБРАЖЕНИЯМИ VISION (vision_images)
+# ==============================================================================
+
+_VISION_COLUMNS = """
+    id, chat_id, telegram_message_id, business_connection_id, sender_id,
+    telegram_file_id, telegram_file_unique_id, media_group_id, caption,
+    local_file_path, original_filename, mime_type, file_size, sha256_hash,
+    vision_status, analysis_json, image_description, short_summary, ocr_text,
+    category, confidence, task_id, trello_card_id, trello_attachment_id,
+    attachment_status, retry_count, last_error, context_saved,
+    clarification_sent, created_at, updated_at
+"""
+
+
+async def get_vision_image(
+    chat_id: int,
+    telegram_message_id: int,
+    db_path: Optional[str] = None,
+) -> Optional[Dict[str, Any]]:
+    """Возвращает запись vision_images по (chat_id, telegram_message_id)."""
+    if is_postgres_configured(db_path):
+        pool = await get_pg_pool()
+        async with pool.acquire() as conn:
+            row = await conn.fetchrow(
+                f"SELECT {_VISION_COLUMNS} FROM vision_images WHERE chat_id = $1 AND telegram_message_id = $2",
+                chat_id,
+                telegram_message_id,
+            )
+            return dict(row) if row else None
+    else:
+        target_path = _get_db_path(db_path)
+        async with aiosqlite.connect(target_path) as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute(
+                f"SELECT {_VISION_COLUMNS} FROM vision_images WHERE chat_id = ? AND telegram_message_id = ?",
+                (chat_id, telegram_message_id),
+            ) as cursor:
+                row = await cursor.fetchone()
+                return dict(row) if row else None
+
+
+async def get_vision_image_by_id(
+    image_id: int,
+    db_path: Optional[str] = None,
+) -> Optional[Dict[str, Any]]:
+    """Возвращает запись vision_images по первичному ключу id."""
+    if is_postgres_configured(db_path):
+        pool = await get_pg_pool()
+        async with pool.acquire() as conn:
+            row = await conn.fetchrow(
+                f"SELECT {_VISION_COLUMNS} FROM vision_images WHERE id = $1",
+                image_id,
+            )
+            return dict(row) if row else None
+    else:
+        target_path = _get_db_path(db_path)
+        async with aiosqlite.connect(target_path) as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute(
+                f"SELECT {_VISION_COLUMNS} FROM vision_images WHERE id = ?",
+                (image_id,),
+            ) as cursor:
+                row = await cursor.fetchone()
+                return dict(row) if row else None
+
+
+async def create_vision_image(
+    chat_id: int,
+    telegram_message_id: int,
+    sender_id: int,
+    telegram_file_id: Optional[str] = None,
+    telegram_file_unique_id: Optional[str] = None,
+    media_group_id: Optional[str] = None,
+    business_connection_id: Optional[str] = None,
+    caption: Optional[str] = None,
+    db_path: Optional[str] = None,
+) -> Tuple[int, bool]:
+    """
+    Идемпотентно создает запись в vision_images.
+    Возвращает (record_id, created_bool).
+    """
+    existing = await get_vision_image(chat_id, telegram_message_id, db_path=db_path)
+    if existing:
+        return int(existing["id"]), False
+
+    now_str = get_now().strftime("%Y-%m-%d %H:%M:%S")
+    if is_postgres_configured(db_path):
+        pool = await get_pg_pool()
+        async with pool.acquire() as conn:
+            rec_id = await conn.fetchval(
+                """
+                INSERT INTO vision_images (
+                    chat_id, telegram_message_id, business_connection_id, sender_id,
+                    telegram_file_id, telegram_file_unique_id, media_group_id, caption,
+                    vision_status, attachment_status, created_at, updated_at
+                )
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'pending', 'none', $9, $10)
+                ON CONFLICT (chat_id, telegram_message_id) DO NOTHING
+                RETURNING id
+                """,
+                chat_id, telegram_message_id, business_connection_id, sender_id,
+                telegram_file_id, telegram_file_unique_id, media_group_id, caption,
+                now_str, now_str,
+            )
+            if rec_id is not None:
+                return int(rec_id), True
+            ex = await get_vision_image(chat_id, telegram_message_id, db_path=db_path)
+            return (int(ex["id"]), False) if ex else (0, False)
+    else:
+        target_path = _get_db_path(db_path)
+        async with aiosqlite.connect(target_path) as db:
+            cursor = await db.execute(
+                """
+                INSERT OR IGNORE INTO vision_images (
+                    chat_id, telegram_message_id, business_connection_id, sender_id,
+                    telegram_file_id, telegram_file_unique_id, media_group_id, caption,
+                    vision_status, attachment_status, created_at, updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', 'none', ?, ?)
+                """,
+                (
+                    chat_id, telegram_message_id, business_connection_id, sender_id,
+                    telegram_file_id, telegram_file_unique_id, media_group_id, caption,
+                    now_str, now_str,
+                ),
+            )
+            await db.commit()
+            if cursor.rowcount > 0:
+                return int(cursor.lastrowid), True
+        ex = await get_vision_image(chat_id, telegram_message_id, db_path=db_path)
+        return (int(ex["id"]), False) if ex else (0, False)
+
+
+async def update_vision_image(
+    chat_id: int,
+    telegram_message_id: int,
+    *,
+    local_file_path: Optional[str] = None,
+    clear_local_file_path: bool = False,
+    original_filename: Optional[str] = None,
+    mime_type: Optional[str] = None,
+    file_size: Optional[int] = None,
+    sha256_hash: Optional[str] = None,
+    vision_status: Optional[str] = None,
+    analysis_json: Optional[str] = None,
+    image_description: Optional[str] = None,
+    short_summary: Optional[str] = None,
+    ocr_text: Optional[str] = None,
+    category: Optional[str] = None,
+    confidence: Optional[float] = None,
+    task_id: Optional[int] = None,
+    trello_card_id: Optional[str] = None,
+    trello_attachment_id: Optional[str] = None,
+    attachment_status: Optional[str] = None,
+    retry_count: Optional[int] = None,
+    last_error: Optional[str] = None,
+    clear_last_error: bool = False,
+    context_saved: Optional[int] = None,
+    clarification_sent: Optional[int] = None,
+    db_path: Optional[str] = None,
+) -> bool:
+    """Обновляет поля записи vision_images по (chat_id, telegram_message_id)."""
+    update_fields: Dict[str, Any] = {
+        "updated_at": get_now().strftime("%Y-%m-%d %H:%M:%S"),
+    }
+    if clear_local_file_path:
+        update_fields["local_file_path"] = None
+    elif local_file_path is not None:
+        update_fields["local_file_path"] = local_file_path
+
+    if original_filename is not None:
+        update_fields["original_filename"] = original_filename
+    if mime_type is not None:
+        update_fields["mime_type"] = mime_type
+    if file_size is not None:
+        update_fields["file_size"] = file_size
+    if sha256_hash is not None:
+        update_fields["sha256_hash"] = sha256_hash
+    if vision_status is not None:
+        update_fields["vision_status"] = vision_status
+    if analysis_json is not None:
+        update_fields["analysis_json"] = analysis_json
+    if image_description is not None:
+        update_fields["image_description"] = image_description
+    if short_summary is not None:
+        update_fields["short_summary"] = short_summary
+    if ocr_text is not None:
+        update_fields["ocr_text"] = ocr_text
+    if category is not None:
+        update_fields["category"] = category
+    if confidence is not None:
+        update_fields["confidence"] = confidence
+    if task_id is not None:
+        update_fields["task_id"] = task_id
+    if trello_card_id is not None:
+        update_fields["trello_card_id"] = trello_card_id
+    if trello_attachment_id is not None:
+        update_fields["trello_attachment_id"] = trello_attachment_id
+    if attachment_status is not None:
+        update_fields["attachment_status"] = attachment_status
+    if retry_count is not None:
+        update_fields["retry_count"] = retry_count
+    if clear_last_error:
+        update_fields["last_error"] = None
+    elif last_error is not None:
+        update_fields["last_error"] = last_error
+    if context_saved is not None:
+        update_fields["context_saved"] = int(context_saved)
+    if clarification_sent is not None:
+        update_fields["clarification_sent"] = int(clarification_sent)
+
+    if is_postgres_configured(db_path):
+        pool = await get_pg_pool()
+        field_strs = [f"{col} = ${i + 1}" for i, col in enumerate(update_fields.keys())]
+        values = list(update_fields.values()) + [chat_id, telegram_message_id]
+        query = (
+            f"UPDATE vision_images SET {', '.join(field_strs)} "
+            f"WHERE chat_id = ${len(values) - 1} AND telegram_message_id = ${len(values)}"
+        )
+        async with pool.acquire() as conn:
+            res = await conn.execute(query, *values)
+            return res.endswith("1")
+    else:
+        target_path = _get_db_path(db_path)
+        field_strs = [f"{col} = ?" for col in update_fields.keys()]
+        values = list(update_fields.values()) + [chat_id, telegram_message_id]
+        query = (
+            f"UPDATE vision_images SET {', '.join(field_strs)} "
+            f"WHERE chat_id = ? AND telegram_message_id = ?"
+        )
+        async with aiosqlite.connect(target_path) as db:
+            cursor = await db.execute(query, values)
+            await db.commit()
+            return cursor.rowcount > 0
+
+
+async def get_unattached_vision_images_for_messages(
+    message_ids: List[int],
+    db_path: Optional[str] = None,
+) -> List[Dict[str, Any]]:
+    """Возвращает завершенные записи vision_images без task_id для указанных message_id."""
+    if not message_ids:
+        return []
+    unique_ids = sorted({int(mid) for mid in message_ids})
+    if is_postgres_configured(db_path):
+        pool = await get_pg_pool()
+        placeholders = ", ".join(f"${i + 1}" for i in range(len(unique_ids)))
+        query = (
+            f"SELECT {_VISION_COLUMNS} FROM vision_images "
+            f"WHERE telegram_message_id IN ({placeholders}) "
+            f"AND vision_status = 'completed' AND task_id IS NULL "
+            f"ORDER BY telegram_message_id ASC"
+        )
+        async with pool.acquire() as conn:
+            rows = await conn.fetch(query, *unique_ids)
+            return [dict(r) for r in rows]
+    else:
+        target_path = _get_db_path(db_path)
+        placeholders = ", ".join("?" for _ in unique_ids)
+        query = (
+            f"SELECT {_VISION_COLUMNS} FROM vision_images "
+            f"WHERE telegram_message_id IN ({placeholders}) "
+            f"AND vision_status = 'completed' AND task_id IS NULL "
+            f"ORDER BY telegram_message_id ASC"
+        )
+        async with aiosqlite.connect(target_path) as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute(query, unique_ids) as cursor:
+                rows = await cursor.fetchall()
+                return [dict(r) for r in rows]
+
+
+async def get_vision_images_by_media_group(
+    chat_id: int,
+    media_group_id: str,
+    db_path: Optional[str] = None,
+) -> List[Dict[str, Any]]:
+    """Возвращает все записи vision_images в рамках одного альбома (media_group_id)."""
+    if is_postgres_configured(db_path):
+        pool = await get_pg_pool()
+        async with pool.acquire() as conn:
+            rows = await conn.fetch(
+                f"SELECT {_VISION_COLUMNS} FROM vision_images "
+                f"WHERE chat_id = $1 AND media_group_id = $2 ORDER BY telegram_message_id ASC",
+                chat_id,
+                media_group_id,
+            )
+            return [dict(r) for r in rows]
+    else:
+        target_path = _get_db_path(db_path)
+        async with aiosqlite.connect(target_path) as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute(
+                f"SELECT {_VISION_COLUMNS} FROM vision_images "
+                f"WHERE chat_id = ? AND media_group_id = ? ORDER BY telegram_message_id ASC",
+                (chat_id, media_group_id),
+            ) as cursor:
+                rows = await cursor.fetchall()
+                return [dict(r) for r in rows]
+
+
+async def get_vision_images_for_task(
+    task_id: int,
+    db_path: Optional[str] = None,
+) -> List[Dict[str, Any]]:
+    """Возвращает все изображения, привязанные к задаче task_id."""
+    if is_postgres_configured(db_path):
+        pool = await get_pg_pool()
+        async with pool.acquire() as conn:
+            rows = await conn.fetch(
+                f"SELECT {_VISION_COLUMNS} FROM vision_images WHERE task_id = $1 ORDER BY telegram_message_id ASC",
+                task_id,
+            )
+            return [dict(r) for r in rows]
+    else:
+        target_path = _get_db_path(db_path)
+        async with aiosqlite.connect(target_path) as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute(
+                f"SELECT {_VISION_COLUMNS} FROM vision_images WHERE task_id = ? ORDER BY telegram_message_id ASC",
+                (task_id,),
+            ) as cursor:
+                rows = await cursor.fetchall()
+                return [dict(r) for r in rows]
+
+
+async def has_duplicate_trello_attachment(
+    trello_card_id: str,
+    sha256_hash: Optional[str] = None,
+    telegram_file_unique_id: Optional[str] = None,
+    db_path: Optional[str] = None,
+) -> bool:
+    """Проверяет, прикреплено ли уже такое же фото (по sha256 или file_unique_id) к данной карточке Trello."""
+    if not trello_card_id or (not sha256_hash and not telegram_file_unique_id):
+        return False
+
+    if is_postgres_configured(db_path):
+        pool = await get_pg_pool()
+        async with pool.acquire() as conn:
+            clauses = []
+            params: List[Any] = [trello_card_id]
+            idx = 2
+            if sha256_hash:
+                clauses.append(f"sha256_hash = ${idx}")
+                params.append(sha256_hash)
+                idx += 1
+            if telegram_file_unique_id:
+                clauses.append(f"telegram_file_unique_id = ${idx}")
+                params.append(telegram_file_unique_id)
+            query = (
+                f"SELECT 1 FROM vision_images "
+                f"WHERE trello_card_id = $1 AND attachment_status = 'attached' "
+                f"AND ({' OR '.join(clauses)}) LIMIT 1"
+            )
+            row = await conn.fetchval(query, *params)
+            return row is not None
+    else:
+        target_path = _get_db_path(db_path)
+        clauses = []
+        params = [trello_card_id]
+        if sha256_hash:
+            clauses.append("sha256_hash = ?")
+            params.append(sha256_hash)
+        if telegram_file_unique_id:
+            clauses.append("telegram_file_unique_id = ?")
+            params.append(telegram_file_unique_id)
+        query = (
+            f"SELECT 1 FROM vision_images "
+            f"WHERE trello_card_id = ? AND attachment_status = 'attached' "
+            f"AND ({' OR '.join(clauses)}) LIMIT 1"
+        )
+        async with aiosqlite.connect(target_path) as db:
+            async with db.execute(query, params) as cursor:
+                row = await cursor.fetchone()
+                return row is not None
+
+
+async def get_pending_trello_attachments(
+    max_retries: int = 3,
+    db_path: Optional[str] = None,
+) -> List[Dict[str, Any]]:
+    """Возвращает записи vision_images, ожидающие повторной загрузки вложения в Trello."""
+    if is_postgres_configured(db_path):
+        pool = await get_pg_pool()
+        async with pool.acquire() as conn:
+            rows = await conn.fetch(
+                f"SELECT {_VISION_COLUMNS} FROM vision_images "
+                f"WHERE task_id IS NOT NULL "
+                f"AND attachment_status IN ('pending', 'failed') "
+                f"AND retry_count < $1 "
+                f"ORDER BY id ASC",
+                max_retries,
+            )
+            return [dict(r) for r in rows]
+    else:
+        target_path = _get_db_path(db_path)
+        async with aiosqlite.connect(target_path) as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute(
+                f"SELECT {_VISION_COLUMNS} FROM vision_images "
+                f"WHERE task_id IS NOT NULL "
+                f"AND attachment_status IN ('pending', 'failed') "
+                f"AND retry_count < ? "
+                f"ORDER BY id ASC",
+                (max_retries,),
+            ) as cursor:
+                rows = await cursor.fetchall()
+                return [dict(r) for r in rows]
+
+
+async def get_interrupted_vision_images(
+    db_path: Optional[str] = None,
+) -> List[Dict[str, Any]]:
+    """Возвращает записи vision_images, прерванные перезапуском бота в состоянии downloading/analyzing."""
+    query = (
+        f"SELECT {_VISION_COLUMNS} FROM vision_images "
+        f"WHERE vision_status IN ('downloading', 'analyzing') ORDER BY id ASC"
+    )
+    if is_postgres_configured(db_path):
+        pool = await get_pg_pool()
+        async with pool.acquire() as conn:
+            rows = await conn.fetch(query)
+            return [dict(r) for r in rows]
+    else:
+        target_path = _get_db_path(db_path)
+        async with aiosqlite.connect(target_path) as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute(query) as cursor:
+                rows = await cursor.fetchall()
+                return [dict(r) for r in rows]
 
 
 if __name__ == "__main__":

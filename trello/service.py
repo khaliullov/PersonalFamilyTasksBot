@@ -257,6 +257,68 @@ class TrelloSyncService:
         )
         return res is not None
 
+    async def attach_image_to_card(
+        self,
+        card_id: str,
+        file_path: str,
+        *,
+        filename: Optional[str] = None,
+        mime_type: str = "image/jpeg",
+        name: Optional[str] = None,
+        max_attempts: int = 3,
+        base_delay_seconds: float = 2.0,
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Прикрепляет оригинальное изображение к карточке Trello с проверкой дубликатов
+        и ограниченными повторами (exponential backoff) при транзиентных сбоях.
+        """
+        if not self.is_enabled or not card_id or not file_path:
+            return None
+
+        target_name = name or filename or "photo.jpg"
+
+        # Проверка существующих вложений по имени файла для предотвращения дубликатов при ретраях
+        if hasattr(self.client, "get_card_attachments"):
+            try:
+                existing = await self.client.get_card_attachments(card_id)
+                for att in existing:
+                    if isinstance(att, dict) and att.get("name") == target_name:
+                        logger.info(
+                            "Вложение '%s' уже присутствует на карточке Trello %s (id=%s).",
+                            target_name,
+                            card_id,
+                            att.get("id"),
+                        )
+                        return att
+            except Exception as exc:
+                logger.debug("Проверка существующих вложений карточки %s пропущена: %s", card_id, type(exc).__name__)
+
+        attempts = max(1, int(max_attempts))
+        for attempt in range(1, attempts + 1):
+            result = await self.client.upload_card_attachment(
+                card_id=card_id,
+                file_path=file_path,
+                filename=filename,
+                mime_type=mime_type,
+                name=target_name,
+            )
+            if result is not None:
+                return result
+
+            if attempt < attempts:
+                delay = base_delay_seconds * (2 ** (attempt - 1))
+                logger.warning(
+                    "Повтор загрузки вложения на карточку Trello %s через %.1f с (попытка %d/%d)...",
+                    card_id,
+                    delay,
+                    attempt,
+                    attempts,
+                )
+                if delay > 0:
+                    await asyncio.sleep(delay)
+
+        return None
+
     async def sync_task_completed(self, trello_card_id: str) -> bool:
         """
         Перемещает карточку в колонку Done (завершенные) в Trello.

@@ -5,5 +5,6 @@ asyncpg>=0.29.0
 apscheduler>=3.10.0,<4.0.0
 caldav>=2.2.0
 python-dotenv>=1.0.0
+Pillow>=10.0.0
 faster-whisper>=1.0.0; python_version < "3.14"
 av<19; python_version < "3.14"
